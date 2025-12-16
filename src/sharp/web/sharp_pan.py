@@ -123,6 +123,31 @@ def _resize_max_side(image_rgb: np.ndarray, max_side: int) -> np.ndarray:
     return np.asarray(img, dtype=np.uint8)
 
 
+def _resize_max_side_with_scale(image_rgb: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    """Resize while returning the uniform scale factor applied.
+
+    Returns (resized_image_rgb, scale). `scale` is 1.0 when no resize occurs.
+    """
+    if max_side <= 0:
+        return image_rgb, 1.0
+    height, width = image_rgb.shape[:2]
+    longest = max(height, width)
+    if longest <= max_side:
+        return image_rgb, 1.0
+    scale = max_side / float(longest)
+    new_w = max(2, int(round(width * scale)))
+    new_h = max(2, int(round(height * scale)))
+
+    img = Image.fromarray(image_rgb)
+    resample_bicubic = getattr(
+        getattr(Image, "Resampling", None),
+        "BICUBIC",
+        getattr(Image, "BICUBIC", 3),
+    )
+    img = img.resize((new_w, new_h), resample=resample_bicubic)
+    return np.asarray(img, dtype=np.uint8), float(scale)
+
+
 @torch.no_grad()
 def _predict_gaussians(image_rgb: np.ndarray, f_px: float, device: torch.device) -> Gaussians3D:
     # This mirrors `sharp.cli.predict.predict_image`.
@@ -130,7 +155,8 @@ def _predict_gaussians(image_rgb: np.ndarray, f_px: float, device: torch.device)
 
     image_pt = torch.from_numpy(image_rgb.copy()).float().to(device).permute(2, 0, 1) / 255.0
     _, height, width = image_pt.shape
-    disparity_factor = torch.tensor([f_px / width]).float().to(device)
+
+    disparity_factor = torch.tensor([f_px / width], device=device, dtype=torch.float32)
 
     image_resized_pt = F.interpolate(
         image_pt[None],
@@ -221,39 +247,97 @@ def _render_depth_parallax_swipe_mp4(
     (monodepth sub-network) to compute a depth field, then warps the image along
     a left↔right trajectory.
     """
-    # Keep memory bounded on MPS/CPU.
-    image_rgb = _resize_max_side(image_rgb, max_side=1024)
-    image_rgb = _ensure_even_hw_uint8_rgb(image_rgb)
+    # Keep memory bounded on MPS/CPU and keep intrinsics consistent.
+    resized, scale = _resize_max_side_with_scale(image_rgb, max_side=1024)
+    f_px = float(f_px) * float(scale)
+    resized_w = int(resized.shape[1])
+    image_rgb = _ensure_even_hw_uint8_rgb(resized)
+    f_px = float(f_px) * (float(image_rgb.shape[1]) / max(1.0, float(resized_w)))
 
     image_pt, depth = _predict_depth_for_warp(image_rgb, f_px, device)
     _, _, height, width = image_pt.shape
 
-    # Compute a normalized inverse-depth map (near -> +1, far -> -1).
-    inv_depth = 1.0 / depth.clamp(min=1e-3)
-
-    # Use cheap quantiles from a downsampled map (computed on CPU for portability).
-    inv_small = F.interpolate(inv_depth, size=(128, 128), mode="bilinear", align_corners=True)
+    # Normalize inverse-depth to [0,1] so far shifts ~0 and near shifts ~1.
+    inv = (1.0 / depth.clamp(min=1e-3))[0, 0]
+    inv_small = F.interpolate(inv[None, None], size=(128, 128), mode="bilinear", align_corners=True)
     inv_cpu = inv_small.detach().float().cpu().flatten()
-    q05 = torch.quantile(inv_cpu, 0.05).item()
-    q50 = torch.quantile(inv_cpu, 0.50).item()
-    q95 = torch.quantile(inv_cpu, 0.95).item()
-    scale = max(1e-6, (q95 - q05))
+    q05 = float(torch.quantile(inv_cpu, 0.05).item())
+    q95 = float(torch.quantile(inv_cpu, 0.95).item())
+    scale_inv = max(1e-6, (q95 - q05))
+    inv01 = ((inv - q05) / scale_inv).clamp(0.0, 1.0)
 
-    inv_norm = (inv_depth - q50) / scale
-    inv_norm = inv_norm.clamp(min=-1.0, max=1.0)
+    # Edge-aware stabilization of inverse-depth.
+    # Minor monodepth noise around strong RGB edges can cause "zippering" in the
+    # plane assignment, which shows up as thin cracks/ghosting during parallax.
+    lum = (0.299 * image_pt[0, 0] + 0.587 * image_pt[0, 1] + 0.114 * image_pt[0, 2]).to(
+        torch.float32
+    )
+    sobel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        device=device,
+        dtype=torch.float32,
+    )[None, None]
+    sobel_y = torch.tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+        device=device,
+        dtype=torch.float32,
+    )[None, None]
+    gx = F.conv2d(lum[None, None], sobel_x, padding=1)
+    gy = F.conv2d(lum[None, None], sobel_y, padding=1)
+    edge = (gx.abs() + gy.abs())[0, 0]
+    edge_small = F.interpolate(edge[None, None], size=(128, 128), mode="bilinear", align_corners=True)
+    edge_cpu = edge_small.detach().float().cpu().flatten()
+    e90 = float(torch.quantile(edge_cpu, 0.90).item())
+    edge01 = (edge / max(1e-6, e90)).clamp(0.0, 1.0)
+    # Smooth more in flat regions, less across edges.
+    # Aggressive settings help suppress residual cracking/"black trails".
+    for _ in range(4):
+        inv01_blur = F.avg_pool2d(inv01[None, None], kernel_size=9, stride=1, padding=4)[0, 0]
+        alpha = 0.60 * (1.0 - edge01).pow(2.0)
+        inv01 = inv01 * (1.0 - alpha) + inv01_blur * alpha
 
-    # Pixel shift map; max_disparity ~ fraction of width.
-    max_shift_px = float(max_disparity) * float(width)
-    shift_px = inv_norm * max_shift_px
+    # Build depth planes (MPI) and composite far->near.
+    # Use a *two-plane* soft assignment in inverse-depth space. This reduces
+    # edge tearing vs. hard one-hot binning while keeping the layer model.
+    num_planes = 32
+    pos = inv01 * float(num_planes - 1)
+    idx0 = torch.floor(pos).to(torch.int64).clamp(0, num_planes - 1)
+    idx1 = (idx0 + 1).clamp(0, num_planes - 1)
+    frac = (pos - idx0.to(pos.dtype)).clamp(0.0, 1.0)
+    w0 = (1.0 - frac).to(dtype=torch.float32)
+    w1 = frac.to(dtype=torch.float32)
 
-    # Base sampling grid.
-    ys = torch.linspace(-1.0, 1.0, height, device=device)
-    xs = torch.linspace(-1.0, 1.0, width, device=device)
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-    base_grid = torch.stack([grid_x, grid_y], dim=-1)[None]  # (1, H, W, 2)
+    one_hot0 = F.one_hot(idx0, num_classes=num_planes).permute(2, 0, 1).to(dtype=torch.float32)
+    one_hot1 = F.one_hot(idx1, num_classes=num_planes).permute(2, 0, 1).to(dtype=torch.float32)
+    plane_a = (one_hot0 * w0[None, :, :] + one_hot1 * w1[None, :, :])[:, None, :, :]  # (L,1,H,W)
+    plane_rgb = image_pt[0][None].to(torch.float32) * plane_a  # premultiplied
 
+    # Travel restriction (20%..80%) to avoid extreme ends.
     frame_count = max(2, int(round(duration_s * fps)))
-    ts = torch.linspace(-1.0, 1.0, frame_count)
+    ts = torch.linspace(-0.6, 0.6, frame_count, device=device, dtype=torch.float32)
+
+    # Pixel shift amplitude.
+    max_shift_px = float(max_disparity) * float(width)
+
+    # Avoid tearing at both ends by rendering into a replicate-padded canvas and
+    # cropping back. This avoids relying on grid_sample padding_mode="border",
+    # which isn't consistently supported on MPS.
+    max_abs_t = 0.6
+    pad_x = int(np.ceil(max_abs_t * max_shift_px)) + 2
+    pad_y = 2
+    height_p = height + 2 * pad_y
+    width_p = width + 2 * pad_x
+    plane_a_p = F.pad(plane_a, (pad_x, pad_x, pad_y, pad_y), mode="replicate")
+    plane_rgb_p = F.pad(plane_rgb, (pad_x, pad_x, pad_y, pad_y), mode="replicate")
+
+    # Base sampling grid (padded canvas).
+    ys = torch.linspace(-1.0, 1.0, height_p, device=device)
+    xs = torch.linspace(-1.0, 1.0, width_p, device=device)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    base_grid = torch.stack([grid_x, grid_y], dim=-1)[None]  # (1,Hp,Wp,2)
+
+    # Diffusion kernel to fill cracks/holes without using the original frame.
+    kernel = torch.ones((1, 1, 5, 5), device=device, dtype=torch.float32)
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         output_path = Path(tmp.name)
@@ -265,22 +349,79 @@ def _render_depth_parallax_swipe_mp4(
             codec="libx264",
             pixelformat="yuv420p",
             quality=8,
+            macro_block_size=1,
         )
         try:
             for t in ts:
-                # Normalize pixel shift into [-1,1] space for grid_sample.
-                x_shift = (2.0 * float(t) * shift_px) / max(1.0, float(width - 1))
-                grid = base_grid.clone()
-                # Keep sampling inside bounds for MPS compatibility.
-                grid[..., 0] = (grid[..., 0] + x_shift[:, 0, :, :]).clamp(-1.0, 1.0)
-                warped = F.grid_sample(
-                    image_pt,
-                    grid,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=True,
+                out_rgb = torch.zeros((1, 3, height_p, width_p), device=device, dtype=torch.float32)
+                out_a = torch.zeros((1, 1, height_p, width_p), device=device, dtype=torch.float32)
+
+                for li in range(num_planes):
+                    center01 = float(li) / max(1.0, float(num_planes - 1))
+                    shift_px = center01 * float(t) * max_shift_px
+                    x_shift = (2.0 * shift_px) / max(1.0, float(width_p - 1))
+                    grid = base_grid.clone()
+                    grid[..., 0] = grid[..., 0] + x_shift
+
+                    # Soft alpha only to unpremultiply (avoid dark fringes).
+                    a_soft = F.grid_sample(
+                        plane_a_p[li : li + 1],
+                        grid,
+                        mode="bilinear",
+                        padding_mode="zeros",
+                        align_corners=True,
+                    )
+                    rgb_premul = F.grid_sample(
+                        plane_rgb_p[li : li + 1],
+                        grid,
+                        mode="bilinear",
+                        padding_mode="zeros",
+                        align_corners=True,
+                    )
+
+                    # Premultiplied-alpha compositing. Avoiding per-layer unpremultiply
+                    # removes division noise that shows up as jagged "rips" at strong
+                    # depth discontinuities.
+                    a = a_soft.clamp(0.0, 1.0)
+                    rgb = rgb_premul
+
+                    out_rgb = out_rgb + (1.0 - out_a) * rgb
+                    out_a = out_a + (1.0 - out_a) * a
+
+                # Crop back to original frame size.
+                out_rgb = out_rgb[:, :, pad_y : pad_y + height, pad_x : pad_x + width]
+                out_a = out_a[:, :, pad_y : pad_y + height, pad_x : pad_x + width]
+
+                # Diffuse-fill tiny holes in the final unpremultiplied image.
+                img = out_rgb / out_a.clamp(min=1e-4)
+                # Treat low-alpha pixels as holes to avoid amplifying tiny alpha via
+                # unpremultiply (which can look like thin black cracks / black trails).
+                m = (out_a > 0.20).to(torch.float32)
+
+                # De-pepper: sometimes you get isolated dark speckles near soft edges
+                # where alpha is non-zero but unreliable. Detect those and treat them
+                # as holes so the diffusion fill overwrites them.
+                lum = (0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]).clamp(0.0, 1.0)
+                lum_mean = F.avg_pool2d(lum, kernel_size=3, stride=1, padding=1)
+                speckle = (
+                    (m > 0.5)
+                    & (out_a < 0.90)
+                    & (lum < (0.25 * lum_mean))
+                    & (lum_mean > 0.06)
                 )
-                frame = (warped[0].permute(1, 2, 0) * 255.0).clamp(0, 255).to(torch.uint8)
+                m = torch.where(speckle, torch.zeros_like(m), m)
+
+                for _ in range(6):
+                    if float(m.mean().item()) > 0.999:
+                        break
+                    sum_rgb = F.conv2d(img * m, kernel.expand(3, 1, 5, 5), padding=2, groups=3)
+                    cnt = F.conv2d(m, kernel, padding=2)
+                    fill = sum_rgb / cnt.clamp(min=1.0)
+                    fill_mask = (cnt > 0.0).to(dtype=torch.float32)
+                    img = torch.where(m.bool(), img, fill)
+                    m = torch.where(m.bool(), m, fill_mask)
+
+                frame = (img[0].permute(1, 2, 0) * 255.0).clamp(0, 255).to(torch.uint8)
                 frame_np = frame.detach().cpu().numpy()
                 frame_np = _ensure_even_hw_uint8_rgb(frame_np)
                 writer.append_data(frame_np)
@@ -298,6 +439,7 @@ def generate_sharp_swipe_mp4(
     duration_s: float = 4.0,
     fps: int = 30,
     max_disparity: float = 0.08,
+    motion_scale: float = 0.20,
 ) -> bytes:
     """Generate a model-based swipe (horizontal pan) MP4.
 
@@ -307,6 +449,12 @@ def generate_sharp_swipe_mp4(
         raise ValueError("duration_s must be > 0")
     if fps <= 0:
         raise ValueError("fps must be > 0")
+
+    # Scale the overall swipe motion (centered) while keeping the rendering logic intact.
+    # 1.0 = full motion, 0.1 = 10% of the motion, etc.
+    if motion_scale <= 0:
+        raise ValueError("motion_scale must be > 0")
+    max_disparity = float(max_disparity) * float(motion_scale)
 
     image_rgb, f_px = _load_upload_rgb_and_fpx(image_bytes)
     image_rgb = _ensure_even_hw_uint8_rgb(image_rgb)

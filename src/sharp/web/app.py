@@ -27,9 +27,19 @@ HTML_INDEX = """<!doctype html>
         <p>
           <label>FPS: <input type=\"number\" name=\"fps\" value=\"30\" step=\"1\" min=\"1\" max=\"60\" /></label>
         </p>
+        <p>
+          <label>Motion:</label>
+          <select name=\"motion_scale\">
+            <option value=\"0.10\">Very small (10%)</option>
+            <option value=\"0.20\" selected>Small (20%)</option>
+            <option value=\"0.30\">Medium (30%)</option>
+            <option value=\"0.50\">Large (50%)</option>
+            <option value=\"1.00\">Full (100%)</option>
+          </select>
+        </p>
         <button type=\"submit\">Generate MP4</button>
       </form>
-      <p>Trajectory: linear camera swipe between computed extremes.</p>
+      <p>Trajectory: centered horizontal swipe; “Motion” controls the travel width.</p>
     </main>
   </body>
 </html>
@@ -63,9 +73,15 @@ def create_app():
         image: UploadFile = File(...),
         duration_s: float = Form(4.0),
         fps: int = Form(30),
+        motion_scale: float = Form(0.20),
     ):
         image_bytes = await image.read()
-        video_bytes = generate_sharp_swipe_mp4(image_bytes, duration_s=duration_s, fps=fps)
+        video_bytes = generate_sharp_swipe_mp4(
+            image_bytes,
+            duration_s=duration_s,
+            fps=fps,
+            motion_scale=motion_scale,
+        )
 
         headers = {"Content-Disposition": "attachment; filename=pan.mp4"}
         return Response(content=video_bytes, media_type="video/mp4", headers=headers)

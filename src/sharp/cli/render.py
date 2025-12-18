@@ -13,7 +13,7 @@ import click
 import torch
 import torch.utils.data
 
-from sharp.utils import camera, gsplat, io
+from sharp.utils import camera, io
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import Gaussians3D, SceneMetaData, load_ply
 
@@ -59,12 +59,16 @@ def render_cli(input_path: Path, output_path: Path, verbose: bool):
     for scene_path in scene_paths:
         LOGGER.info("Rendering %s", scene_path)
         gaussians, metadata = load_ply(scene_path)
-        render_gaussians(
-            gaussians=gaussians,
-            metadata=metadata,
-            params=params,
-            output_path=(output_path / scene_path.stem).with_suffix(".mp4"),
-        )
+        try:
+            render_gaussians(
+                gaussians=gaussians,
+                metadata=metadata,
+                params=params,
+                output_path=(output_path / scene_path.stem).with_suffix(".mp4"),
+            )
+        except RuntimeError as exc:
+            LOGGER.error(str(exc))
+            exit(1)
 
 
 def render_gaussians(
@@ -74,6 +78,14 @@ def render_gaussians(
     params: camera.TrajectoryParams | None = None,
 ) -> None:
     """Render a single gaussian checkpoint file."""
+    try:
+        from sharp.utils import gsplat
+    except Exception as exc:
+        raise RuntimeError(
+            "gsplat renderer is not available. Rendering currently targets CUDA on Linux; "
+            "try the web demo (depth-parallax) or run inside WSL/Linux with gsplat installed."
+        ) from exc
+
     (width, height) = metadata.resolution_px
     f_px = metadata.focal_length_px
 

@@ -1,7 +1,7 @@
-"""Model-based horizontal panning using SHARP.
+"""Model-based motion rendering using SHARP.
 
 This uses the same pipeline as `sharp predict --render`, but tailored for a simple
-"swipe" camera trajectory and returning MP4 bytes.
+single-image camera trajectory and returning MP4 bytes.
 
 For licensing see accompanying LICENSE file.
 Copyright (C) 2025 Apple Inc. All Rights Reserved.
@@ -13,7 +13,7 @@ import io
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Literal
 
 import imageio.v2 as iio
 import numpy as np
@@ -32,6 +32,18 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
 
 _STATE_DICT: dict[str, Any] | None = None
 _PREDICTOR_BY_DEVICE: dict[str, RGBGaussianPredictor] = {}
+
+TrajectoryType = Literal["swipe", "shake", "rotate", "rotate_forward"]
+ProgressCallback = Callable[[str, float, str | None], None]
+
+
+def _safe_progress(progress_cb: ProgressCallback | None, stage: str, progress: float, detail: str) -> None:
+    if progress_cb is None:
+        return
+    try:
+        progress_cb(stage, float(progress), detail)
+    except Exception:
+        return
 
 
 def _load_upload_rgb_and_fpx(image_bytes: bytes) -> tuple[np.ndarray, float]:
@@ -231,8 +243,58 @@ def _predict_depth_for_warp(
     return image_pt[None], depth
 
 
+def _trajectory_xyzoom(
+    trajectory_type: TrajectoryType,
+    frame_count: int,
+    num_repeats: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (tx, ty, zoom01) arrays for each frame.
+
+    tx/ty are in roughly [-1, 1] and represent a normalized lateral motion
+    direction. zoom01 is in [0,1] and can be used to modulate a per-layer zoom.
+    """
+    frame_count = int(max(2, frame_count))
+    num_repeats = int(max(1, num_repeats))
+    ps = np.linspace(0.0, 1.0, frame_count, dtype=np.float32)
+
+    if trajectory_type == "swipe":
+        tx = np.linspace(-0.6, 0.6, frame_count, dtype=np.float32)
+        ty = np.zeros_like(tx)
+        zoom01 = np.zeros_like(tx)
+        return tx, ty, zoom01
+
+    if trajectory_type == "shake":
+        tx = np.zeros((frame_count,), dtype=np.float32)
+        ty = np.zeros((frame_count,), dtype=np.float32)
+        zoom01 = np.zeros((frame_count,), dtype=np.float32)
+        mid = frame_count // 2
+        p0 = np.linspace(0.0, float(num_repeats), max(1, mid), dtype=np.float32)
+        p1 = np.linspace(0.0, float(num_repeats), frame_count - mid, dtype=np.float32)
+        if mid > 0:
+            tx[:mid] = np.sin(2.0 * np.pi * p0)
+        if frame_count - mid > 0:
+            ty[mid:] = np.sin(2.0 * np.pi * p1)
+        return tx, ty, zoom01
+
+    if trajectory_type == "rotate":
+        ang = (2.0 * np.pi) * (float(num_repeats) * ps)
+        tx = np.sin(ang).astype(np.float32)
+        ty = np.cos(ang).astype(np.float32)
+        zoom01 = np.zeros_like(tx)
+        return tx, ty, zoom01
+
+    if trajectory_type == "rotate_forward":
+        ang = (2.0 * np.pi) * (float(num_repeats) * ps)
+        tx = np.sin(ang).astype(np.float32)
+        ty = np.zeros_like(tx)
+        zoom01 = ((1.0 - np.cos(ang)) / 2.0).astype(np.float32)
+        return tx, ty, zoom01
+
+    raise ValueError(f"Unsupported trajectory_type={trajectory_type!r}")
+
+
 @torch.no_grad()
-def _render_depth_parallax_swipe_mp4(
+def _render_depth_parallax_trajectory_mp4(
     image_rgb: np.ndarray,
     f_px: float,
     device: torch.device,
@@ -241,23 +303,31 @@ def _render_depth_parallax_swipe_mp4(
     fps: int,
     max_disparity: float,
     wobble_scale: float,
+    trajectory_type: TrajectoryType,
+    max_zoom: float,
+    num_repeats: int,
+    max_side: int,
+    progress_cb: ProgressCallback | None,
 ) -> bytes:
     """MPS/CPU fallback: depth-based parallax warp.
 
     This is not full 3D Gaussian splatting, but it still uses the SHARP model
     (monodepth sub-network) to compute a depth field, then warps the image along
-    a left↔right trajectory.
+    a lightweight camera-motion trajectory (e.g. swipe, shake, rotate).
     """
     # Keep memory bounded on MPS/CPU and keep intrinsics consistent.
-    resized, scale = _resize_max_side_with_scale(image_rgb, max_side=1024)
+    resized, scale = _resize_max_side_with_scale(image_rgb, max_side=int(max_side))
     f_px = float(f_px) * float(scale)
     resized_w = int(resized.shape[1])
     image_rgb = _ensure_even_hw_uint8_rgb(resized)
     f_px = float(f_px) * (float(image_rgb.shape[1]) / max(1.0, float(resized_w)))
 
+    _safe_progress(progress_cb, "inference", 0.0, "Predicting depth…")
     image_pt, depth = _predict_depth_for_warp(image_rgb, f_px, device)
+    _safe_progress(progress_cb, "inference", 1.0, "Depth ready.")
     _, _, height, width = image_pt.shape
 
+    _safe_progress(progress_cb, "trajectory", 0.15, "Building depth planes…")
     # Normalize inverse-depth to [0,1] so far shifts ~0 and near shifts ~1.
     inv = (1.0 / depth.clamp(min=1e-3))[0, 0]
     inv_small = F.interpolate(inv[None, None], size=(128, 128), mode="bilinear", align_corners=True)
@@ -313,9 +383,12 @@ def _render_depth_parallax_swipe_mp4(
     plane_a = (one_hot0 * w0[None, :, :] + one_hot1 * w1[None, :, :])[:, None, :, :]  # (L,1,H,W)
     plane_rgb = image_pt[0][None].to(torch.float32) * plane_a  # premultiplied
 
-    # Travel restriction (20%..80%) to avoid extreme ends.
     frame_count = max(2, int(round(duration_s * fps)))
-    ts = torch.linspace(-0.6, 0.6, frame_count, device=device, dtype=torch.float32)
+    tx_np, ty_np, zoom01_np = _trajectory_xyzoom(trajectory_type, frame_count, num_repeats)
+    tx = torch.from_numpy(tx_np).to(device=device, dtype=torch.float32)
+    ty = torch.from_numpy(ty_np).to(device=device, dtype=torch.float32)
+    zoom01 = torch.from_numpy(zoom01_np).to(device=device, dtype=torch.float32)
+    _safe_progress(progress_cb, "trajectory", 1.0, "Trajectory ready.")
 
     # Pixel shift amplitude.
     max_shift_px = float(max_disparity) * float(width)
@@ -328,9 +401,10 @@ def _render_depth_parallax_swipe_mp4(
     # Avoid tearing at both ends by rendering into a replicate-padded canvas and
     # cropping back. This avoids relying on grid_sample padding_mode="border",
     # which isn't consistently supported on MPS.
-    max_abs_t = 0.6
-    pad_x = int(np.ceil(max_abs_t * max_shift_px)) + 2
-    pad_y = int(np.ceil(y_amp_px)) + 2
+    max_abs_tx = float(tx.abs().max().item()) if frame_count > 0 else 0.6
+    max_abs_ty = float(ty.abs().max().item()) if frame_count > 0 else 0.0
+    pad_x = int(np.ceil(max_abs_tx * max_shift_px)) + 2
+    pad_y = int(np.ceil(max_abs_ty * max_shift_px + y_amp_px)) + 2
     height_p = height + 2 * pad_y
     width_p = width + 2 * pad_x
     plane_a_p = F.pad(plane_a, (pad_x, pad_x, pad_y, pad_y), mode="replicate")
@@ -349,6 +423,7 @@ def _render_depth_parallax_swipe_mp4(
         output_path = Path(tmp.name)
 
     try:
+        _safe_progress(progress_cb, "render", 0.0, "Rendering frames…")
         writer = iio.get_writer(
             output_path,
             fps=fps,
@@ -358,24 +433,40 @@ def _render_depth_parallax_swipe_mp4(
             macro_block_size=1,
         )
         try:
-            for frame_idx, t in enumerate(ts.tolist()):
-                t = torch.tensor(t, device=device, dtype=torch.float32)
+            for frame_idx in range(frame_count):
                 progress = 0.0 if frame_count <= 1 else float(frame_idx) / float(frame_count - 1)
-                # Use a half cosine so horizontal ends map to -1 and +1.
-                # progress=0 -> -1, progress=1 -> +1
-                y_shift_px = float(y_amp_px) * float(-np.cos(np.pi * progress))
-                y_shift = (2.0 * y_shift_px) / max(1.0, float(height_p - 1))
+                _safe_progress(
+                    progress_cb,
+                    "render",
+                    float(progress),
+                    f"Frame {frame_idx + 1}/{frame_count}",
+                )
+
+                t_x = tx[frame_idx]
+                t_y = ty[frame_idx]
+                zoom_t = float(max(0.0, max_zoom)) * float(zoom01[frame_idx].item())
+
+                wobble_px = 0.0
+                if trajectory_type == "swipe" and y_amp_px > 0.0:
+                    wobble_px = float(y_amp_px) * float(-np.cos(np.pi * progress))
+
+                y_shift = (2.0 * float(wobble_px)) / max(1.0, float(height_p - 1))
 
                 out_rgb = torch.zeros((1, 3, height_p, width_p), device=device, dtype=torch.float32)
                 out_a = torch.zeros((1, 1, height_p, width_p), device=device, dtype=torch.float32)
 
                 for li in range(num_planes):
                     center01 = float(li) / max(1.0, float(num_planes - 1))
-                    shift_px = center01 * float(t) * max_shift_px
-                    x_shift = (2.0 * shift_px) / max(1.0, float(width_p - 1))
-                    grid = base_grid.clone()
+                    shift_x_px = center01 * float(t_x) * max_shift_px
+                    shift_y_px = center01 * float(t_y) * max_shift_px
+                    x_shift = (2.0 * shift_x_px) / max(1.0, float(width_p - 1))
+                    y_shift_layer = (2.0 * shift_y_px) / max(1.0, float(height_p - 1))
+
+                    zoom_layer = float(zoom_t) * float(center01)
+                    scale = max(0.35, 1.0 - zoom_layer)
+                    grid = base_grid * scale
                     grid[..., 0] = grid[..., 0] + x_shift
-                    grid[..., 1] = grid[..., 1] + y_shift
+                    grid[..., 1] = grid[..., 1] + y_shift + y_shift_layer
 
                     # Soft alpha only to unpremultiply (avoid dark fringes).
                     a_soft = F.grid_sample(
@@ -442,6 +533,7 @@ def _render_depth_parallax_swipe_mp4(
         finally:
             writer.close()
 
+        _safe_progress(progress_cb, "render", 1.0, "Frames rendered.")
         return output_path.read_bytes()
     finally:
         output_path.unlink(missing_ok=True)
@@ -455,15 +547,31 @@ def generate_sharp_swipe_mp4(
     max_disparity: float = 0.08,
     motion_scale: float = 0.20,
     wobble_scale: float = 0.25,
-) -> bytes:
-    """Generate a model-based swipe (horizontal pan) MP4.
+    trajectory_type: TrajectoryType | str = "swipe",
+    max_zoom: float = 0.15,
+    num_repeats: int = 1,
+    max_side: int = 1536,
+    render_max_side: int = 1536,
+    progress_cb: ProgressCallback | None = None,
+    return_meta: bool = False,
+) -> bytes | tuple[bytes, dict[str, Any]]:
+    """Generate a model-based motion MP4.
 
-    Requires CUDA, because gsplat rendering is CUDA-only in this repo.
+    - CUDA: predicts 3D Gaussians and renders a true camera trajectory (gsplat).
+    - MPS/CPU: depth-based parallax warp driven by SHARP monodepth.
     """
     if duration_s <= 0:
         raise ValueError("duration_s must be > 0")
     if fps <= 0:
         raise ValueError("fps must be > 0")
+    if num_repeats <= 0:
+        raise ValueError("num_repeats must be > 0")
+    if max_side <= 0:
+        raise ValueError("max_side must be > 0")
+    if render_max_side < 0:
+        raise ValueError("render_max_side must be >= 0")
+    if max_zoom < 0:
+        raise ValueError("max_zoom must be >= 0")
 
     # Scale the overall swipe motion (centered) while keeping the rendering logic intact.
     # 1.0 = full motion, 0.1 = 10% of the motion, etc.
@@ -474,24 +582,155 @@ def generate_sharp_swipe_mp4(
     if wobble_scale < 0:
         raise ValueError("wobble_scale must be >= 0")
 
+    trajectory_t = str(trajectory_type)
+    allowed = {"swipe", "shake", "rotate", "rotate_forward"}
+    if trajectory_t not in allowed:
+        raise ValueError(f"trajectory_type must be one of {sorted(allowed)} (got {trajectory_t!r})")
+
+    _safe_progress(progress_cb, "load", 0.0, "Loading image…")
     image_rgb, f_px = _load_upload_rgb_and_fpx(image_bytes)
     image_rgb = _ensure_even_hw_uint8_rgb(image_rgb)
     height, width = image_rgb.shape[:2]
+    _safe_progress(progress_cb, "load", 1.0, f"Image ready ({width}×{height}).")
+
+    if render_max_side and render_max_side > 0:
+        longest = max(image_rgb.shape[:2])
+        if longest > int(render_max_side):
+            resized, scale = _resize_max_side_with_scale(image_rgb, max_side=int(render_max_side))
+            image_rgb = _ensure_even_hw_uint8_rgb(resized)
+            f_px = float(f_px) * float(scale)
+            height, width = image_rgb.shape[:2]
+            _safe_progress(progress_cb, "load", 1.0, f"Image resized to {width}×{height}.")
 
     device = _pick_device()
+    meta: dict[str, Any] = {"device": str(device)}
 
     # Full 3DGS rendering path (CUDA).
     if device.type == "cuda":
         # Lazy import so macOS/MPS environments can still start the web server.
-        from sharp.utils.gsplat import GSplatRenderer
+        try:
+            from sharp.utils.gsplat import GSplatRenderer
+        except Exception as exc:
+            LOGGER.warning(
+                "CUDA detected but gsplat renderer unavailable; falling back to depth-parallax. (%s)",
+                exc,
+            )
+            device = torch.device("cuda")  # keep CUDA for depth path
+            meta["device"] = str(device)
+        else:
+            _safe_progress(progress_cb, "inference", 0.0, "Running SHARP inference…")
+            gaussians = _predict_gaussians(image_rgb, f_px, device)
+            _safe_progress(progress_cb, "inference", 1.0, "Gaussians ready.")
 
+            metadata = SceneMetaData(f_px, (width, height), "linearRGB")
+
+            frame_count = max(2, int(round(duration_s * fps)))
+            params = camera.TrajectoryParams(
+                type=trajectory_t, num_steps=frame_count, num_repeats=int(num_repeats)
+            )
+            params.max_disparity = float(max_disparity)
+            params.max_zoom = float(max_zoom)
+
+            intrinsics = torch.tensor(
+                [
+                    [f_px, 0, (width - 1) / 2.0, 0],
+                    [0, f_px, (height - 1) / 2.0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ],
+                device=device,
+                dtype=torch.float32,
+            )
+
+            camera_model = camera.create_camera_model(
+                gaussians, intrinsics, resolution_px=metadata.resolution_px
+            )
+            _safe_progress(progress_cb, "trajectory", 0.0, "Creating trajectory…")
+            trajectory = camera.create_eye_trajectory(
+                gaussians, params, resolution_px=metadata.resolution_px, f_px=f_px
+            )
+            if trajectory_t == "swipe" and wobble_scale > 0:
+                max_offset_xyz_m = camera.compute_max_offset(
+                    gaussians,
+                    params,
+                    resolution_px=metadata.resolution_px,
+                    f_px=f_px,
+                )
+                _, offset_y_m, _ = max_offset_xyz_m
+                y_amp_m = float(wobble_scale) * 0.04 * float(offset_y_m)
+                ps = np.linspace(0.0, 1.0, len(trajectory), dtype=np.float32)
+                trajectory = [
+                    eye + torch.tensor([0.0, float(y_amp_m * (-np.cos(np.pi * float(p)))), 0.0])
+                    for (eye, p) in zip(trajectory, ps, strict=True)
+                ]
+            _safe_progress(progress_cb, "trajectory", 1.0, "Trajectory ready.")
+
+            renderer = GSplatRenderer(color_space=metadata.color_space)
+
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                output_path = Path(tmp.name)
+
+            try:
+                _safe_progress(progress_cb, "render", 0.0, "Rendering frames…")
+                writer = iio.get_writer(
+                    output_path,
+                    fps=fps,
+                    codec="libx264",
+                    pixelformat="yuv420p",
+                    quality=8,
+                )
+                try:
+                    for frame_idx, eye_position in enumerate(trajectory):
+                        progress = (
+                            1.0
+                            if len(trajectory) <= 1
+                            else float(frame_idx) / float(len(trajectory) - 1)
+                        )
+                        _safe_progress(
+                            progress_cb,
+                            "render",
+                            progress,
+                            f"Frame {frame_idx + 1}/{len(trajectory)}",
+                        )
+                        camera_info = camera_model.compute(eye_position.to(device))
+                        rendering_output = renderer(
+                            gaussians.to(device),
+                            extrinsics=camera_info.extrinsics[None].to(device),
+                            intrinsics=camera_info.intrinsics[None].to(device),
+                            image_width=camera_info.width,
+                            image_height=camera_info.height,
+                        )
+                        color = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
+                            dtype=torch.uint8
+                        )
+                        frame = color.detach().cpu().numpy()
+                        frame = _ensure_even_hw_uint8_rgb(frame)
+                        writer.append_data(frame)
+                finally:
+                    writer.close()
+
+                _safe_progress(progress_cb, "render", 1.0, "Frames rendered.")
+                _safe_progress(progress_cb, "finalize", 0.0, "Finalizing…")
+                video_bytes = output_path.read_bytes()
+                _safe_progress(progress_cb, "finalize", 1.0, "Done.")
+                if return_meta:
+                    return video_bytes, meta
+                return video_bytes
+            finally:
+                output_path.unlink(missing_ok=True)
+
+        _safe_progress(progress_cb, "inference", 0.0, "Running SHARP inference…")
         gaussians = _predict_gaussians(image_rgb, f_px, device)
+        _safe_progress(progress_cb, "inference", 1.0, "Gaussians ready.")
 
         metadata = SceneMetaData(f_px, (width, height), "linearRGB")
 
         frame_count = max(2, int(round(duration_s * fps)))
-        params = camera.TrajectoryParams(type="swipe", num_steps=frame_count, num_repeats=1)
+        params = camera.TrajectoryParams(
+            type=trajectory_t, num_steps=frame_count, num_repeats=int(num_repeats)
+        )
         params.max_disparity = float(max_disparity)
+        params.max_zoom = float(max_zoom)
 
         intrinsics = torch.tensor(
             [
@@ -507,25 +746,25 @@ def generate_sharp_swipe_mp4(
         camera_model = camera.create_camera_model(
             gaussians, intrinsics, resolution_px=metadata.resolution_px
         )
-        # Centered horizontal swipe with a slight vertical cosine oscillation.
-        max_offset_xyz_m = camera.compute_max_offset(
-            gaussians,
-            params,
-            resolution_px=metadata.resolution_px,
-            f_px=f_px,
+        _safe_progress(progress_cb, "trajectory", 0.0, "Creating trajectory…")
+        trajectory = camera.create_eye_trajectory(
+            gaussians, params, resolution_px=metadata.resolution_px, f_px=f_px
         )
-        offset_x_m, offset_y_m, _ = max_offset_xyz_m
-        y_amp_m = float(wobble_scale) * 0.04 * float(offset_y_m)
-        xs = np.linspace(-float(offset_x_m), float(offset_x_m), frame_count)
-        ps = np.linspace(0.0, 1.0, frame_count)
-        trajectory = [
-            torch.tensor(
-                # Half cosine so ends map to -1 and +1.
-                [float(x), float(y_amp_m * (-np.cos(np.pi * p))), float(params.distance_m)],
-                dtype=torch.float32,
+        if trajectory_t == "swipe" and wobble_scale > 0:
+            max_offset_xyz_m = camera.compute_max_offset(
+                gaussians,
+                params,
+                resolution_px=metadata.resolution_px,
+                f_px=f_px,
             )
-            for x, p in zip(xs, ps, strict=True)
-        ]
+            _, offset_y_m, _ = max_offset_xyz_m
+            y_amp_m = float(wobble_scale) * 0.04 * float(offset_y_m)
+            ps = np.linspace(0.0, 1.0, len(trajectory), dtype=np.float32)
+            trajectory = [
+                eye + torch.tensor([0.0, float(y_amp_m * (-np.cos(np.pi * float(p)))), 0.0])
+                for (eye, p) in zip(trajectory, ps, strict=True)
+            ]
+        _safe_progress(progress_cb, "trajectory", 1.0, "Trajectory ready.")
 
         renderer = GSplatRenderer(color_space=metadata.color_space)
 
@@ -533,6 +772,7 @@ def generate_sharp_swipe_mp4(
             output_path = Path(tmp.name)
 
         try:
+            _safe_progress(progress_cb, "render", 0.0, "Rendering frames…")
             writer = iio.get_writer(
                 output_path,
                 fps=fps,
@@ -541,7 +781,18 @@ def generate_sharp_swipe_mp4(
                 quality=8,
             )
             try:
-                for eye_position in trajectory:
+                for frame_idx, eye_position in enumerate(trajectory):
+                    progress = (
+                        1.0
+                        if len(trajectory) <= 1
+                        else float(frame_idx) / float(len(trajectory) - 1)
+                    )
+                    _safe_progress(
+                        progress_cb,
+                        "render",
+                        progress,
+                        f"Frame {frame_idx + 1}/{len(trajectory)}",
+                    )
                     camera_info = camera_model.compute(eye_position.to(device))
                     rendering_output = renderer(
                         gaussians.to(device),
@@ -559,13 +810,19 @@ def generate_sharp_swipe_mp4(
             finally:
                 writer.close()
 
-            return output_path.read_bytes()
+            _safe_progress(progress_cb, "render", 1.0, "Frames rendered.")
+            _safe_progress(progress_cb, "finalize", 0.0, "Finalizing…")
+            video_bytes = output_path.read_bytes()
+            _safe_progress(progress_cb, "finalize", 1.0, "Done.")
+            if return_meta:
+                return video_bytes, meta
+            return video_bytes
         finally:
             output_path.unlink(missing_ok=True)
 
     # Fallback: use monodepth to produce depth-based parallax warp (MPS/CPU).
     LOGGER.warning("CUDA not available; using depth-parallax fallback on %s", device.type)
-    return _render_depth_parallax_swipe_mp4(
+    video_bytes = _render_depth_parallax_trajectory_mp4(
         image_rgb,
         f_px,
         device,
@@ -573,4 +830,13 @@ def generate_sharp_swipe_mp4(
         fps=fps,
         max_disparity=max_disparity,
         wobble_scale=wobble_scale,
+        trajectory_type=trajectory_t,  # type: ignore[arg-type]
+        max_zoom=max_zoom,
+        num_repeats=num_repeats,
+        max_side=max_side,
+        progress_cb=progress_cb,
     )
+    _safe_progress(progress_cb, "finalize", 1.0, "Done.")
+    if return_meta:
+        return video_bytes, meta
+    return video_bytes

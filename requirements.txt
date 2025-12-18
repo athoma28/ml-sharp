@@ -26,7 +26,7 @@ fsspec==2025.9.0
     # via
     #   huggingface-hub
     #   torch
-gsplat==1.5.3
+gsplat==1.5.3 ; sys_platform != 'win32'
     # via sharp
 hf-xet==1.1.10 ; platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'
     # via huggingface-hub

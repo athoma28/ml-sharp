@@ -152,7 +152,10 @@ def predict_cli(
             LOGGER.info("Rendering trajectory to %s", output_video_path)
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
-            render_gaussians(gaussians, metadata, output_video_path)
+            try:
+                render_gaussians(gaussians, metadata, output_video_path)
+            except RuntimeError as exc:
+                LOGGER.warning("Skipping rendering: %s", exc)
 
 
 @torch.no_grad()

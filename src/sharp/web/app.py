@@ -186,6 +186,19 @@ HTML_INDEX = """<!doctype html>
         gap: 10px;
         flex-wrap: wrap;
       }
+      .check{
+        display:flex;
+        align-items:center;
+        gap: 8px;
+        margin-top: 10px;
+        font-size: 13px;
+        color: var(--txt);
+      }
+      .check input{
+        width:auto;
+        margin:0;
+        accent-color: var(--accent);
+      }
       .dropzone{
         border: 1.5px dashed var(--line);
         border-radius: 14px;
@@ -322,6 +335,38 @@ HTML_INDEX = """<!doctype html>
       .media{
         display:grid;
         gap: 12px;
+      }
+      .viewer{
+        margin-top: 12px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 12px;
+        background: rgba(255,255,255,.03);
+      }
+      .viewer-head{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:10px;
+        margin-bottom: 10px;
+      }
+      .viewer-head .title{
+        font-weight: 700;
+        font-size: 13px;
+      }
+      .viewer-frame{
+        position: relative;
+        width:100%;
+        aspect-ratio: 16/10;
+        border-radius: 12px;
+        overflow:hidden;
+        border: 1px solid var(--line);
+        background: rgba(0,0,0,.2);
+      }
+      .viewer-frame iframe{
+        width:100%;
+        height:100%;
+        border:0;
       }
       .preview{
         width:100%;
@@ -489,6 +534,18 @@ HTML_INDEX = """<!doctype html>
                 </div>
               </details>
 
+              <div class=\"row\" style=\"margin-top:10px\">
+                <div>
+                  <label for=\"output_mode\">Outputs</label>
+                  <select id=\"output_mode\" name=\"output_mode\">
+                    <option value=\"depth\" selected>Depth MP4 only</option>
+                    <option value=\"ply\">PLY only</option>
+                    <option value=\"both\">Both MP4 + PLY</option>
+                  </select>
+                  <p class=\"hint\">“Depth MP4” forces the fast fallback render; “PLY” runs full SHARP to export 3DGS; “Both” does both.</p>
+                </div>
+              </div>
+
               <div class=\"btns\">
                 <button id=\"goBtn\" type=\"submit\">Generate MP4</button>
                 <button class=\"secondary\" id=\"resetBtn\" type=\"button\">Reset</button>
@@ -530,6 +587,10 @@ HTML_INDEX = """<!doctype html>
                 <progress id=\"p_render\" value=\"0\" max=\"1\"></progress>
               </div>
               <div class=\"stage\">
+                <div class=\"nm\"><strong>PLY export</strong><span class=\"val\" id=\"s_ply\">–</span></div>
+                <progress id=\"p_ply\" value=\"0\" max=\"1\"></progress>
+              </div>
+              <div class=\"stage\">
                 <div class=\"nm\"><strong>Finalize</strong><span class=\"val\" id=\"s_finalize\">–</span></div>
                 <progress id=\"p_finalize\" value=\"0\" max=\"1\"></progress>
               </div>
@@ -543,7 +604,22 @@ HTML_INDEX = """<!doctype html>
               </div>
               <div class=\"dl\">
                 <div class=\"small\" id=\"detailText\">–</div>
-                <a id=\"downloadLink\" href=\"#\" style=\"display:none\">download mp4</a>
+                <div style=\"display:flex;gap:10px;flex-wrap:wrap;align-items:center\">
+                  <a id=\"downloadLink\" href=\"#\" style=\"display:none\">download mp4</a>
+                  <a id=\"downloadPlyLink\" href=\"#\" style=\"display:none\">download ply</a>
+                </div>
+              </div>
+              <div class=\"viewer\" id=\"viewerBlock\" style=\"display:none\">
+                <div class=\"viewer-head\">
+                  <div>
+                    <div class=\"title\">Gaussian splat viewer</div>
+                    <div class=\"small\">Loads the exported .ply into the Spark viewer.</div>
+                  </div>
+                  <button class=\"secondary\" type=\"button\" id=\"openViewerBtn\">Open viewer</button>
+                </div>
+                <div class=\"viewer-frame\">
+                  <iframe id=\"splatFrame\" title=\"Gaussian splat viewer\" allowfullscreen></iframe>
+                </div>
               </div>
             </div>
           </div>
@@ -554,7 +630,7 @@ HTML_INDEX = """<!doctype html>
     <script>
       const $ = (id) => document.getElementById(id);
 
-      const stageIds = [\"load\",\"inference\",\"trajectory\",\"render\",\"finalize\"];
+      const stageIds = [\"load\",\"inference\",\"trajectory\",\"render\",\"ply\",\"finalize\"];
       function setErr(msg){
         const box = $(\"errBox\");
         if(!msg){
@@ -589,6 +665,11 @@ HTML_INDEX = """<!doctype html>
       const dropHint = $(\"dropHint\");
       const defaultDropThumb = \"IMG\";
       const defaultDropHint = \"JPEG / PNG / HEIC\";
+      const downloadLink = $(\"downloadLink\");
+      const downloadPlyLink = $(\"downloadPlyLink\");
+      const viewerBlock = $(\"viewerBlock\");
+      const splatFrame = $(\"splatFrame\");
+      const openViewerBtn = $(\"openViewerBtn\");
 
       function setFile(file){
         if(!file) return;
@@ -661,7 +742,10 @@ HTML_INDEX = """<!doctype html>
         $(\"detailText\").textContent = \"–\";
         stageIds.forEach(s => setProgress(s, 0, \"–\"));
         setOverall(0);
-        $(\"downloadLink\").style.display = \"none\";
+        downloadLink.style.display = \"none\";
+        downloadPlyLink.style.display = \"none\";
+        viewerBlock.style.display = \"none\";
+        splatFrame.removeAttribute(\"src\");
         $(\"vidPrev\").removeAttribute(\"src\");
         $(\"vidPrev\").style.display = \"none\";
         $(\"ph\").style.display = \"block\";
@@ -678,7 +762,10 @@ HTML_INDEX = """<!doctype html>
         $(\"imgPrev\").style.display = \"block\";
         $(\"ph\").style.display = \"none\";
         $(\"vidPrev\").style.display = \"none\";
-        $(\"downloadLink\").style.display = \"none\";
+        downloadLink.style.display = \"none\";
+        downloadPlyLink.style.display = \"none\";
+        viewerBlock.style.display = \"none\";
+        splatFrame.removeAttribute(\"src\");
         dropHint.textContent = f.name;
         const ext = (f.type.split(\"/\")[1] || defaultDropThumb).slice(0, 4).toUpperCase();
         dropThumb.textContent = ext || defaultDropThumb;
@@ -716,16 +803,41 @@ HTML_INDEX = """<!doctype html>
           if(st.status === \"done\"){
             setStatus(\"done\");
             setErr(\"\");
-            const resultUrl = `/jobs/${jobId}/result`;
-            const downloadUrl = `${resultUrl}?download=1`;
-            $(\"downloadLink\").href = downloadUrl;
-            $(\"downloadLink\").style.display = \"inline\";
-            $(\"downloadLink\").textContent = \"download mp4\";
-            const vid = $(\"vidPrev\");
-            vid.src = resultUrl;
-            vid.style.display = \"block\";
-            $(\"imgPrev\").style.display = \"none\";
-            $(\"ph\").style.display = \"none\";
+            if(st.video_ready){
+              const resultUrl = `/jobs/${jobId}/result`;
+              const downloadUrl = `${resultUrl}?download=1`;
+              downloadLink.href = downloadUrl;
+              downloadLink.style.display = \"inline\";
+              downloadLink.textContent = \"download mp4\";
+              const vid = $(\"vidPrev\");
+              vid.src = resultUrl;
+              vid.style.display = \"block\";
+              $(\"imgPrev\").style.display = \"none\";
+              $(\"ph\").style.display = \"none\";
+            }else{
+              downloadLink.style.display = \"none\";
+              const vid = $(\"vidPrev\");
+              vid.removeAttribute(\"src\");
+              vid.style.display = \"none\";
+              $(\"imgPrev\").style.display = \"block\";
+              $(\"ph\").style.display = \"block\";
+            }
+            if(st.ply_ready){
+              const plyUrl = `/jobs/${jobId}/ply`;
+              downloadPlyLink.href = `${plyUrl}?download=1`;
+              downloadPlyLink.style.display = \"inline\";
+              const viewerUrl = `/viewer/?url=${encodeURIComponent(plyUrl)}`;
+              splatFrame.src = viewerUrl;
+              viewerBlock.style.display = \"block\";
+              openViewerBtn.onclick = () => {
+                splatFrame.src = `${viewerUrl}&t=${Date.now()}`;
+                splatFrame.scrollIntoView({ behavior: \"smooth\", block: \"center\" });
+              };
+            }else{
+              downloadPlyLink.style.display = \"none\";
+              viewerBlock.style.display = \"none\";
+              splatFrame.removeAttribute(\"src\");
+            }
             $(\"goBtn\").disabled = false;
             return;
           }
@@ -738,7 +850,10 @@ HTML_INDEX = """<!doctype html>
         setErr(\"\");
         setStatus(\"starting\");
         $(\"goBtn\").disabled = true;
-        $(\"downloadLink\").style.display = \"none\";
+        downloadLink.style.display = \"none\";
+        downloadPlyLink.style.display = \"none\";
+        viewerBlock.style.display = \"none\";
+        splatFrame.removeAttribute(\"src\");
         stageIds.forEach(s => setProgress(s, 0, \"–\"));
         setOverall(0);
 
@@ -839,6 +954,7 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
 
     try:
         from fastapi import FastAPI, File, Form, UploadFile
+        from fastapi.staticfiles import StaticFiles
         from fastapi.responses import HTMLResponse, Response
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
@@ -874,13 +990,29 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
 
         app.add_middleware(_BasicAuthMiddleware, password=web_password)
 
+    root_dir = Path(__file__).resolve().parents[3]
+    splat_dir = root_dir / "splat"
+    if splat_dir.is_dir():
+        app.mount("/splat", StaticFiles(directory=splat_dir, html=True), name="splat")
+    spark_viewer_dir = root_dir / "spark" / "examples" / "viewer"
+    if spark_viewer_dir.is_dir():
+        app.mount(
+            "/viewer",
+            StaticFiles(directory=spark_viewer_dir, html=True),
+            name="spark-viewer",
+        )
+    spark_dist_dir = root_dir / "spark" / "dist"
+    if spark_dist_dir.is_dir():
+        app.mount("/dist", StaticFiles(directory=spark_dist_dir), name="spark-dist")
+
     StageStatus = Literal["pending", "running", "done", "error"]
 
     STAGES: list[tuple[str, str, float]] = [
         ("load", "Load", 0.05),
         ("inference", "Model", 0.25),
         ("trajectory", "Trajectory", 0.05),
-        ("render", "Render", 0.60),
+        ("render", "Render", 0.50),
+        ("ply", "PLY export", 0.10),
         ("finalize", "Finalize", 0.05),
     ]
 
@@ -896,12 +1028,15 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
         created_at_s: float
         updated_at_s: float
         status: Literal["queued", "running", "done", "error"] = "queued"
+        export_ply: bool = False
+        output_mode: Literal["depth", "ply", "both"] = "depth"
         error: str | None = None
         detail: str | None = None
         device: str | None = None
         overall_progress: float = 0.0
         stages: dict[str, _Stage] = dataclasses.field(default_factory=dict)
         video_bytes: bytes | None = None
+        ply_bytes: bytes | None = None
 
     class _JobStore:
         def __init__(self) -> None:
@@ -910,7 +1045,12 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
             self._lock = threading.Lock()
             self._jobs: dict[str, _Job] = {}
 
-        def create(self) -> _Job:
+        def create(
+            self,
+            *,
+            export_ply: bool = False,
+            output_mode: Literal["depth", "ply", "both"] = "depth",
+        ) -> _Job:
             now = time.time()
             job_id = uuid.uuid4().hex[:12]
             stages = {k: _Stage(label=label) for (k, label, _w) in STAGES}
@@ -919,6 +1059,8 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
                 created_at_s=now,
                 updated_at_s=now,
                 status="queued",
+                export_ply=export_ply,
+                output_mode=output_mode,
                 stages=stages,
             )
             with self._lock:
@@ -986,6 +1128,7 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
             detail: str | None = None,
             video_bytes: bytes | None = None,
             device: str | None = None,
+            ply_bytes: bytes | None = None,
         ) -> None:
             now = time.time()
             with self._lock:
@@ -1002,14 +1145,22 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
                     job.video_bytes = video_bytes
                 if device is not None:
                     job.device = device
+                if ply_bytes is not None:
+                    job.ply_bytes = ply_bytes
 
     store = _JobStore()
-    job_queue: asyncio.Queue[tuple[str, bytes, dict[str, Any]]] = asyncio.Queue()
+    job_queue: asyncio.Queue[tuple[str, bytes, dict[str, Any], bool, str]] = asyncio.Queue()
 
-    async def _run_job(job_id: str, image_bytes: bytes, params: dict[str, Any]) -> None:
+    async def _run_job(
+        job_id: str, image_bytes: bytes, params: dict[str, Any], export_ply: bool, output_mode: str
+    ) -> None:
         store.set_status(job_id, "running", detail="Starting render…")
         for stage_key, _label, _w in STAGES:
             store.update_stage(job_id, stage_key, progress=0.0, status="pending")
+        if not export_ply:
+            store.update_stage(job_id, "ply", progress=1.0, status="done", detail="Not requested.")
+        if output_mode == "ply":
+            store.update_stage(job_id, "render", progress=1.0, status="done", detail="Skipped (ply only).")
 
         def progress_cb(stage: str, progress: float, detail: str | None = None) -> None:
             try:
@@ -1024,33 +1175,73 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
                 pass
 
         try:
-            video_bytes, meta = await asyncio.to_thread(
-                generate_sharp_swipe_mp4,
-                image_bytes,
-                progress_cb=progress_cb,
-                return_meta=True,
-                **params,
-            )
+            if output_mode == "ply":
+                # Ply only: run inference path but skip video rendering.
+                _video_bytes, meta, ply_bytes = await asyncio.to_thread(
+                    generate_sharp_swipe_mp4,
+                    image_bytes,
+                    render_video=False,
+                    progress_cb=progress_cb,
+                    return_meta=True,
+                    return_ply=True,
+                    force_depth_fallback=True,
+                    **params,
+                )
+                video_bytes = None
+            elif export_ply:
+                video_bytes, meta, ply_bytes = await asyncio.to_thread(
+                    generate_sharp_swipe_mp4,
+                    image_bytes,
+                    progress_cb=progress_cb,
+                    return_meta=True,
+                    return_ply=True,
+                    force_depth_fallback=True,
+                    **params,
+                )
+            else:
+                video_bytes, meta = await asyncio.to_thread(
+                    generate_sharp_swipe_mp4,
+                    image_bytes,
+                    progress_cb=progress_cb,
+                    return_meta=True,
+                    force_depth_fallback=True,
+                    **params,
+                )
+                ply_bytes = None
+
             device = None
             if isinstance(meta, dict):
                 device = meta.get("device", None)
+            if export_ply:
+                if ply_bytes is None:
+                    raise RuntimeError("PLY generation failed.")
+                size_mb = len(ply_bytes) / 1_000_000.0
+                store.update_stage(job_id, "ply", progress=1.0, status="done", detail=f"{size_mb:.1f} MB")
             store.update_stage(job_id, "finalize", progress=1.0, status="done", device=device)
+            detail_msg = "Done."
+            if video_bytes:
+                detail_msg = detail_msg + f" MP4 {len(video_bytes)/1_000_000.0:.1f} MB"
+            if export_ply and ply_bytes is not None:
+                detail_msg = detail_msg + f" + PLY {len(ply_bytes)/1_000_000.0:.1f} MB"
             store.set_status(
                 job_id,
                 "done",
-                detail=f"Done. {len(video_bytes)/1_000_000.0:.1f} MB",
+                detail=detail_msg,
                 video_bytes=video_bytes,
                 device=device,
+                ply_bytes=ply_bytes,
             )
         except Exception as exc:
+            if export_ply:
+                store.update_stage(job_id, "ply", progress=0.0, status="error")
             store.update_stage(job_id, "finalize", progress=0.0, status="error")
             store.set_status(job_id, "error", error=str(exc), detail="Render failed.")
 
     async def _worker() -> None:
         while True:
-            job_id, image_bytes, params = await job_queue.get()
+            job_id, image_bytes, params, export_ply, output_mode = await job_queue.get()
             try:
-                await _run_job(job_id, image_bytes, params)
+                await _run_job(job_id, image_bytes, params, export_ply, output_mode)
             except Exception as exc:  # pragma: no cover
                 store.set_status(job_id, "error", error=str(exc), detail="Worker failed.")
             finally:
@@ -1117,9 +1308,17 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
         num_repeats: int = Form(1),
         max_side: int = Form(1536),
         render_max_side: int = Form(1536),
+        export_ply: bool = Form(False),
+        output_mode: str = Form("depth"),
     ) -> dict[str, Any]:
         store.cleanup()
-        job = store.create()
+        output_mode = str(output_mode).lower()
+        allowed_modes = {"depth", "ply", "both"}
+        if output_mode not in allowed_modes:
+            raise ValueError(f"output_mode must be one of {sorted(allowed_modes)}")
+        export_ply = bool(export_ply) or output_mode in {"ply", "both"}
+
+        job = store.create(export_ply=export_ply, output_mode=output_mode)  # type: ignore[arg-type]
         job_id = job.job_id
 
         image_bytes = await image.read()
@@ -1135,7 +1334,7 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
             "max_side": max_side,
             "render_max_side": render_max_side,
         }
-        await job_queue.put((job_id, image_bytes, params))
+        await job_queue.put((job_id, image_bytes, params, export_ply, output_mode))
         store.set_status(job_id, "queued", detail="Queued.")
         return {"job_id": job_id}
 
@@ -1152,6 +1351,10 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
             "detail": job.detail,
             "device": job.device,
             "overall_progress": job.overall_progress,
+            "export_ply": job.export_ply,
+            "ply_ready": bool(job.ply_bytes),
+            "video_ready": bool(job.video_bytes),
+            "output_mode": job.output_mode,
             "stages": {
                 k: {"label": st.label, "progress": st.progress, "status": st.status}
                 for (k, st) in job.stages.items()
@@ -1166,6 +1369,15 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
         disposition = "attachment" if int(download) else "inline"
         headers = {"Content-Disposition": f"{disposition}; filename=pan.mp4"}
         return Response(content=job.video_bytes, media_type="video/mp4", headers=headers)
+
+    @app.get("/jobs/{job_id}/ply")
+    def get_ply(job_id: str, download: int = 0):
+        job = store.get(job_id)
+        if job is None or job.status != "done" or job.ply_bytes is None:
+            return Response(content=b"Not ready.", status_code=404)
+        disposition = "attachment" if int(download) else "inline"
+        headers = {"Content-Disposition": f"{disposition}; filename=scene.ply"}
+        return Response(content=job.ply_bytes, media_type="application/octet-stream", headers=headers)
 
     return app
 

@@ -23,7 +23,7 @@ from PIL import Image, ImageOps
 
 from sharp.models import PredictorParams, RGBGaussianPredictor, create_predictor
 from sharp.utils import camera
-from sharp.utils.gaussians import Gaussians3D, SceneMetaData, unproject_gaussians
+from sharp.utils.gaussians import Gaussians3D, SceneMetaData, save_ply, unproject_gaussians
 from sharp.utils.io import convert_focallength, extract_exif
 
 LOGGER = logging.getLogger(__name__)
@@ -202,6 +202,19 @@ def _predict_gaussians(image_rgb: np.ndarray, f_px: float, device: torch.device)
         gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
     )
     return gaussians
+
+
+def _gaussians_to_ply_bytes(
+    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int]
+) -> bytes:
+    """Serialize Gaussians to a .ply file and return the bytes."""
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        save_ply(gaussians, f_px, image_shape, path)
+        return path.read_bytes()
+    finally:
+        path.unlink(missing_ok=True)
 
 
 @torch.no_grad()
@@ -554,11 +567,19 @@ def generate_sharp_swipe_mp4(
     render_max_side: int = 1536,
     progress_cb: ProgressCallback | None = None,
     return_meta: bool = False,
-) -> bytes | tuple[bytes, dict[str, Any]]:
+    return_ply: bool = False,
+    force_depth_fallback: bool = False,
+    render_video: bool = True,
+) -> bytes | tuple[bytes, dict[str, Any]] | tuple[bytes, dict[str, Any], bytes | None]:
     """Generate a model-based motion MP4.
 
     - CUDA: predicts 3D Gaussians and renders a true camera trajectory (gsplat).
     - MPS/CPU: depth-based parallax warp driven by SHARP monodepth.
+
+    Set `return_ply=True` to also export the predicted Gaussians as `.ply` bytes.
+    Set `render_video=False` to only export the PLY (no MP4).
+    Set `force_depth_fallback=True` to always use the depth-based renderer for video,
+    even on CUDA.
     """
     if duration_s <= 0:
         raise ValueError("duration_s must be > 0")
@@ -604,121 +625,26 @@ def generate_sharp_swipe_mp4(
 
     device = _pick_device()
     meta: dict[str, Any] = {"device": str(device)}
+    ply_bytes: bytes | None = None
+    need_video = bool(render_video)
+    need_ply = bool(return_ply)
 
-    # Full 3DGS rendering path (CUDA).
-    if device.type == "cuda":
-        # Lazy import so macOS/MPS environments can still start the web server.
+    use_depth_only = force_depth_fallback or device.type != "cuda"
+    renderer_cls = None
+    if not use_depth_only:
         try:
-            from sharp.utils.gsplat import GSplatRenderer
+            from sharp.utils.gsplat import GSplatRenderer  # type: ignore
         except Exception as exc:
             LOGGER.warning(
                 "CUDA detected but gsplat renderer unavailable; falling back to depth-parallax. (%s)",
                 exc,
             )
-            device = torch.device("cuda")  # keep CUDA for depth path
-            meta["device"] = str(device)
+            use_depth_only = True
         else:
-            _safe_progress(progress_cb, "inference", 0.0, "Running SHARP inference…")
-            gaussians = _predict_gaussians(image_rgb, f_px, device)
-            _safe_progress(progress_cb, "inference", 1.0, "Gaussians ready.")
+            renderer_cls = GSplatRenderer
 
-            metadata = SceneMetaData(f_px, (width, height), "linearRGB")
-
-            frame_count = max(2, int(round(duration_s * fps)))
-            params = camera.TrajectoryParams(
-                type=trajectory_t, num_steps=frame_count, num_repeats=int(num_repeats)
-            )
-            params.max_disparity = float(max_disparity)
-            params.max_zoom = float(max_zoom)
-
-            intrinsics = torch.tensor(
-                [
-                    [f_px, 0, (width - 1) / 2.0, 0],
-                    [0, f_px, (height - 1) / 2.0, 0],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1],
-                ],
-                device=device,
-                dtype=torch.float32,
-            )
-
-            camera_model = camera.create_camera_model(
-                gaussians, intrinsics, resolution_px=metadata.resolution_px
-            )
-            _safe_progress(progress_cb, "trajectory", 0.0, "Creating trajectory…")
-            trajectory = camera.create_eye_trajectory(
-                gaussians, params, resolution_px=metadata.resolution_px, f_px=f_px
-            )
-            if trajectory_t == "swipe" and wobble_scale > 0:
-                max_offset_xyz_m = camera.compute_max_offset(
-                    gaussians,
-                    params,
-                    resolution_px=metadata.resolution_px,
-                    f_px=f_px,
-                )
-                _, offset_y_m, _ = max_offset_xyz_m
-                y_amp_m = float(wobble_scale) * 0.04 * float(offset_y_m)
-                ps = np.linspace(0.0, 1.0, len(trajectory), dtype=np.float32)
-                trajectory = [
-                    eye + torch.tensor([0.0, float(y_amp_m * (-np.cos(np.pi * float(p)))), 0.0])
-                    for (eye, p) in zip(trajectory, ps, strict=True)
-                ]
-            _safe_progress(progress_cb, "trajectory", 1.0, "Trajectory ready.")
-
-            renderer = GSplatRenderer(color_space=metadata.color_space)
-
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                output_path = Path(tmp.name)
-
-            try:
-                _safe_progress(progress_cb, "render", 0.0, "Rendering frames…")
-                writer = iio.get_writer(
-                    output_path,
-                    fps=fps,
-                    codec="libx264",
-                    pixelformat="yuv420p",
-                    quality=8,
-                )
-                try:
-                    for frame_idx, eye_position in enumerate(trajectory):
-                        progress = (
-                            1.0
-                            if len(trajectory) <= 1
-                            else float(frame_idx) / float(len(trajectory) - 1)
-                        )
-                        _safe_progress(
-                            progress_cb,
-                            "render",
-                            progress,
-                            f"Frame {frame_idx + 1}/{len(trajectory)}",
-                        )
-                        camera_info = camera_model.compute(eye_position.to(device))
-                        rendering_output = renderer(
-                            gaussians.to(device),
-                            extrinsics=camera_info.extrinsics[None].to(device),
-                            intrinsics=camera_info.intrinsics[None].to(device),
-                            image_width=camera_info.width,
-                            image_height=camera_info.height,
-                        )
-                        color = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
-                            dtype=torch.uint8
-                        )
-                        frame = color.detach().cpu().numpy()
-                        frame = _ensure_even_hw_uint8_rgb(frame)
-                        writer.append_data(frame)
-                finally:
-                    writer.close()
-
-                _safe_progress(progress_cb, "render", 1.0, "Frames rendered.")
-                _safe_progress(progress_cb, "finalize", 0.0, "Finalizing…")
-                video_bytes = output_path.read_bytes()
-                _safe_progress(progress_cb, "finalize", 1.0, "Done.")
-                if return_meta:
-                    return video_bytes, meta
-                return video_bytes
-            finally:
-                output_path.unlink(missing_ok=True)
-
+    # Full 3DGS rendering path (CUDA + gsplat available + not forced fallback).
+    if not use_depth_only and renderer_cls is not None:
         _safe_progress(progress_cb, "inference", 0.0, "Running SHARP inference…")
         gaussians = _predict_gaussians(image_rgb, f_px, device)
         _safe_progress(progress_cb, "inference", 1.0, "Gaussians ready.")
@@ -766,77 +692,104 @@ def generate_sharp_swipe_mp4(
             ]
         _safe_progress(progress_cb, "trajectory", 1.0, "Trajectory ready.")
 
-        renderer = GSplatRenderer(color_space=metadata.color_space)
-
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            output_path = Path(tmp.name)
-
-        try:
-            _safe_progress(progress_cb, "render", 0.0, "Rendering frames…")
-            writer = iio.get_writer(
-                output_path,
-                fps=fps,
-                codec="libx264",
-                pixelformat="yuv420p",
-                quality=8,
-            )
+        video_bytes: bytes | None = None
+        if need_video:
+            renderer = renderer_cls(color_space=metadata.color_space)
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                output_path = Path(tmp.name)
             try:
-                for frame_idx, eye_position in enumerate(trajectory):
-                    progress = (
-                        1.0
-                        if len(trajectory) <= 1
-                        else float(frame_idx) / float(len(trajectory) - 1)
-                    )
-                    _safe_progress(
-                        progress_cb,
-                        "render",
-                        progress,
-                        f"Frame {frame_idx + 1}/{len(trajectory)}",
-                    )
-                    camera_info = camera_model.compute(eye_position.to(device))
-                    rendering_output = renderer(
-                        gaussians.to(device),
-                        extrinsics=camera_info.extrinsics[None].to(device),
-                        intrinsics=camera_info.intrinsics[None].to(device),
-                        image_width=camera_info.width,
-                        image_height=camera_info.height,
-                    )
-                    color = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
-                        dtype=torch.uint8
-                    )
-                    frame = color.detach().cpu().numpy()
-                    frame = _ensure_even_hw_uint8_rgb(frame)
-                    writer.append_data(frame)
+                _safe_progress(progress_cb, "render", 0.0, "Rendering frames…")
+                writer = iio.get_writer(
+                    output_path,
+                    fps=fps,
+                    codec="libx264",
+                    pixelformat="yuv420p",
+                    quality=8,
+                )
+                try:
+                    for frame_idx, eye_position in enumerate(trajectory):
+                        progress = (
+                            1.0
+                            if len(trajectory) <= 1
+                            else float(frame_idx) / float(len(trajectory) - 1)
+                        )
+                        _safe_progress(
+                            progress_cb,
+                            "render",
+                            progress,
+                            f"Frame {frame_idx + 1}/{len(trajectory)}",
+                        )
+                        camera_info = camera_model.compute(eye_position.to(device))
+                        rendering_output = renderer(
+                            gaussians.to(device),
+                            extrinsics=camera_info.extrinsics[None].to(device),
+                            intrinsics=camera_info.intrinsics[None].to(device),
+                            image_width=camera_info.width,
+                            image_height=camera_info.height,
+                        )
+                        color = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
+                            dtype=torch.uint8
+                        )
+                        frame = color.detach().cpu().numpy()
+                        frame = _ensure_even_hw_uint8_rgb(frame)
+                        writer.append_data(frame)
+                finally:
+                    writer.close()
+
+                _safe_progress(progress_cb, "render", 1.0, "Frames rendered.")
+                video_bytes = output_path.read_bytes()
             finally:
-                writer.close()
+                output_path.unlink(missing_ok=True)
+        else:
+            _safe_progress(progress_cb, "render", 1.0, "Skipped (PLY only).")
 
-            _safe_progress(progress_cb, "render", 1.0, "Frames rendered.")
-            _safe_progress(progress_cb, "finalize", 0.0, "Finalizing…")
-            video_bytes = output_path.read_bytes()
-            _safe_progress(progress_cb, "finalize", 1.0, "Done.")
-            if return_meta:
-                return video_bytes, meta
-            return video_bytes
-        finally:
-            output_path.unlink(missing_ok=True)
+        if need_ply:
+            _safe_progress(progress_cb, "ply", 0.0, "Exporting .ply…")
+            ply_bytes = _gaussians_to_ply_bytes(gaussians, f_px, (height, width))
+            size_mb = len(ply_bytes) / 1_000_000.0
+            _safe_progress(progress_cb, "ply", 1.0, f"{size_mb:.1f} MB")
 
-    # Fallback: use monodepth to produce depth-based parallax warp (MPS/CPU).
-    LOGGER.warning("CUDA not available; using depth-parallax fallback on %s", device.type)
-    video_bytes = _render_depth_parallax_trajectory_mp4(
-        image_rgb,
-        f_px,
-        device,
-        duration_s=duration_s,
-        fps=fps,
-        max_disparity=max_disparity,
-        wobble_scale=wobble_scale,
-        trajectory_type=trajectory_t,  # type: ignore[arg-type]
-        max_zoom=max_zoom,
-        num_repeats=num_repeats,
-        max_side=max_side,
-        progress_cb=progress_cb,
-    )
+        _safe_progress(progress_cb, "finalize", 1.0, "Done.")
+        if need_ply:
+            return video_bytes or b"", meta, ply_bytes
+        if return_meta:
+            return video_bytes or b"", meta
+        return video_bytes or b""
+
+    # Fallback: use monodepth to produce depth-based parallax warp (MPS/CPU or forced).
+    if device.type == "cuda":
+        LOGGER.warning("Using depth-parallax fallback on CUDA (gsplat unavailable or forced).")
+    else:
+        LOGGER.warning("CUDA not available; using depth-parallax fallback on %s", device.type)
+
+    video_bytes = b""
+    if need_video:
+        video_bytes = _render_depth_parallax_trajectory_mp4(
+            image_rgb,
+            f_px,
+            device,
+            duration_s=duration_s,
+            fps=fps,
+            max_disparity=max_disparity,
+            wobble_scale=wobble_scale,
+            trajectory_type=trajectory_t,  # type: ignore[arg-type]
+            max_zoom=max_zoom,
+            num_repeats=num_repeats,
+            max_side=max_side,
+            progress_cb=progress_cb,
+        )
+    else:
+        _safe_progress(progress_cb, "render", 1.0, "Skipped (PLY only).")
+
+    if need_ply:
+        _safe_progress(progress_cb, "ply", 0.0, "Running SHARP inference for PLY…")
+        gaussians = _predict_gaussians(image_rgb, f_px, device)
+        ply_bytes = _gaussians_to_ply_bytes(gaussians, f_px, (height, width))
+        size_mb = len(ply_bytes) / 1_000_000.0
+        _safe_progress(progress_cb, "ply", 1.0, f"{size_mb:.1f} MB")
     _safe_progress(progress_cb, "finalize", 1.0, "Done.")
+    if need_ply:
+        return video_bytes, meta, ply_bytes
     if return_meta:
         return video_bytes, meta
     return video_bytes

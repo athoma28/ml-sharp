@@ -8,7 +8,10 @@ import asyncio
 import base64
 import contextlib
 import dataclasses
+import io
+import json
 import os
+from collections import deque
 from pathlib import Path
 import secrets
 import time
@@ -26,142 +29,279 @@ HTML_INDEX = """<!doctype html>
     <title>SHARP — Motion Video</title>
     <style>
       :root{
-        --bg0:#0b1220;
-        --bg1:#0e1a30;
-        --card:#101b31cc;
-        --card2:#0f172aee;
-        --txt:#e6ecff;
-        --muted:#a9b4d6;
-        --line:#233154;
-        --accent:#7c5cff;
-        --accent2:#27e3c2;
-        --danger:#ff4d6d;
-        --shadow: 0 18px 50px rgba(0,0,0,.35);
-        --radius: 16px;
+        --paper:#f6f4f1;
+        --paper-strong:#ffffff;
+        --ink:#111111;
+        --muted:#5c5c5c;
+        --line:#d7d4cf;
+        --accent:#d40000;
+        --accent-soft:rgba(212,0,0,.12);
+        --shadow: 0 12px 24px rgba(0,0,0,.08);
+        --radius: 12px;
         --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;
-        --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, \"Apple Color Emoji\", \"Segoe UI Emoji\";
-      }
-      @media (prefers-color-scheme: light) {
-        :root{
-          --bg0:#f5f7ff;
-          --bg1:#eef2ff;
-          --card:#ffffffcc;
-          --card2:#ffffffee;
-          --txt:#0b1020;
-          --muted:#4b556e;
-          --line:#d9e0f6;
-          --shadow: 0 18px 50px rgba(5,15,40,.15);
-        }
+        --sans: \"Helvetica Neue\", \"Helvetica\", \"Univers\", \"Akzidenz-Grotesk\", \"Nimbus Sans L\", \"TeX Gyre Heros\", sans-serif;
       }
       *{ box-sizing:border-box; }
       html,body{ height:100%; }
       body{
         margin:0;
         font-family:var(--sans);
-        color:var(--txt);
-        background:
-          radial-gradient(1200px 600px at 15% 10%, rgba(124,92,255,.35), transparent 60%),
-          radial-gradient(900px 550px at 85% 15%, rgba(39,227,194,.28), transparent 55%),
-          linear-gradient(180deg, var(--bg0), var(--bg1));
+        color:var(--ink);
+        background-image:
+          linear-gradient(180deg, #faf9f7 0%, #f1f0ec 100%),
+          linear-gradient(to right, rgba(17,17,17,.06) 1px, transparent 1px),
+          linear-gradient(to bottom, rgba(17,17,17,.06) 1px, transparent 1px);
+        background-size: auto, 120px 120px, 120px 120px;
+        background-attachment: fixed;
       }
-      a{ color:inherit; }
+      a{
+        color:inherit;
+        text-decoration:none;
+        border-bottom: 1px solid rgba(17,17,17,.25);
+      }
+      a:hover{
+        color: var(--accent);
+        border-color: var(--accent);
+      }
       .wrap{
-        max-width: 1120px;
+        max-width: 1240px;
         margin: 0 auto;
-        padding: 28px 18px 50px;
+        padding: 32px 20px 64px;
+        display:grid;
+        gap: 24px;
       }
       header{
+        display:grid;
+        grid-template-columns: repeat(12, minmax(0, 1fr));
+        gap:16px;
+        align-items:end;
+      }
+      .brand{
+        grid-column: 1 / span 8;
+      }
+      .meta{
+        grid-column: 9 / span 4;
         display:flex;
+        justify-content:flex-end;
         align-items:flex-end;
-        justify-content:space-between;
-        gap:18px;
-        margin-bottom: 18px;
+      }
+      .eyebrow{
+        font-size: 11px;
+        letter-spacing: .3em;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin: 0 0 12px;
       }
       .brand h1{
         margin:0;
-        font-size: 22px;
-        letter-spacing: .2px;
+        font-size: clamp(32px, 4vw, 48px);
+        line-height: 1;
+        letter-spacing: -0.01em;
       }
       .brand p{
-        margin:6px 0 0;
+        margin:12px 0 0;
         color:var(--muted);
-        font-size: 13px;
+        font-size: 14px;
         max-width: 720px;
       }
       .pill{
         font-family: var(--mono);
-        font-size: 12px;
-        padding: 8px 10px;
-        border: 1px solid var(--line);
-        border-radius: 999px;
-        background: rgba(255,255,255,.04);
-        color: var(--muted);
+        font-size: 11px;
+        padding: 8px 12px;
+        border: 1px solid var(--ink);
+        text-transform: uppercase;
+        letter-spacing: .18em;
+        background: var(--paper-strong);
         white-space:nowrap;
+      }
+      .tabs{
+        display:flex;
+        gap: 16px;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 6px;
+      }
+      .tab-button{
+        border: none;
+        background: none;
+        color: var(--muted);
+        padding: 10px 2px;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: .2em;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+      }
+      .tab-button.active{
+        color: var(--ink);
+        border-color: var(--accent);
+      }
+      .tab-panel{
+        display:none;
+      }
+      .tab-panel.active{
+        display:grid;
+        gap: 20px;
+      }
+      .basic-actions,
+      .btns{
+        margin-top: 12px;
+        display:flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items:center;
+      }
+      .basic-status{
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .basic-progress{
+        margin-top: 10px;
+      }
+      .basic-progress-bar{
+        height: 8px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(0,0,0,.05);
+        overflow: hidden;
+      }
+      .basic-progress-fill{
+        height: 100%;
+        width: 0%;
+        background: var(--accent);
+        transition: width 0.2s ease;
+      }
+      .basic-queue{
+        margin-top: 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 10px 12px;
+        background: rgba(255,255,255,.7);
+      }
+      .basic-queue ul{
+        list-style: none;
+        padding: 6px 0 0;
+        margin: 0;
+        display: grid;
+        gap: 6px;
+        font-size: 12px;
+      }
+      .basic-queue li{
+        display:flex;
+        justify-content: space-between;
+        gap: 8px;
+        color: var(--muted);
+      }
+      .basic-queue .tag{
+        font-family: var(--mono);
+        color: var(--ink);
+      }
+      .basic-links{
+        margin-top: 10px;
+        display:flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        align-items: center;
+        font-size: 12px;
+      }
+      .basic-links a{
+        text-transform: uppercase;
+        letter-spacing: .12em;
+        font-size: 11px;
       }
       .grid{
         display:grid;
-        grid-template-columns: 1.1fr .9fr;
+        grid-template-columns: repeat(12, minmax(0, 1fr));
         gap: 16px;
       }
-      @media (max-width: 920px){
-        .grid{ grid-template-columns: 1fr; }
+      .grid .card{
+        grid-column: span 6;
+      }
+      .grid .card:nth-child(1){
+        grid-column: 1 / span 7;
+      }
+      .grid .card:nth-child(2){
+        grid-column: 8 / span 5;
+      }
+      @media (max-width: 980px){
+        .grid{
+          grid-template-columns: 1fr;
+        }
+        .grid .card{
+          grid-column: auto;
+        }
       }
       .card{
         border: 1px solid var(--line);
         border-radius: var(--radius);
-        background: var(--card);
-        backdrop-filter: blur(10px);
+        background: rgba(255,255,255,.86);
         box-shadow: var(--shadow);
         overflow:hidden;
       }
       .card .hd{
-        padding: 14px 16px;
+        padding: 16px 18px;
         border-bottom: 1px solid var(--line);
-        background: var(--card2);
+        background: rgba(255,255,255,.95);
         display:flex;
-        align-items:center;
+        align-items:flex-end;
         justify-content:space-between;
         gap: 10px;
       }
       .card .hd h2{
         margin:0;
-        font-size: 14px;
-        letter-spacing: .2px;
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: .18em;
       }
       .card .bd{
-        padding: 16px;
+        padding: 18px;
       }
       .row{
         display:grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 10px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
       }
-      @media (max-width: 540px){
-        .row{ grid-template-columns: 1fr; }
+      @media (max-width: 600px){
+        header{
+          grid-template-columns: 1fr;
+        }
+        .brand,
+        .meta{
+          grid-column: 1 / -1;
+        }
+        .meta{
+          justify-content:flex-start;
+        }
+        .row{
+          grid-template-columns: 1fr;
+        }
       }
       label{
         display:block;
-        font-size: 12px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: .15em;
         color: var(--muted);
         margin-bottom: 6px;
       }
       input[type=file], input[type=number], select{
         width:100%;
         padding: 10px 10px;
-        border-radius: 12px;
-        border: 1px solid var(--line);
-        background: rgba(255,255,255,.05);
-        color: var(--txt);
+        border-radius: 8px;
+        border: 1px solid var(--ink);
+        background: var(--paper-strong);
+        color: var(--ink);
         outline: none;
+        font-family: var(--mono);
       }
       input[type=number]::-webkit-outer-spin-button,
       input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
       input[type=range]{ width:100%; }
       .slider{
         border: 1px solid var(--line);
-        border-radius: 12px;
-        padding: 10px 10px 8px;
-        background: rgba(255,255,255,.04);
+        border-radius: 10px;
+        padding: 10px;
+        background: rgba(255,255,255,.7);
       }
       .slider .top{
         display:flex;
@@ -172,27 +312,21 @@ HTML_INDEX = """<!doctype html>
       }
       .slider .val{
         font-family: var(--mono);
-        font-size: 12px;
-        color: var(--txt);
+        font-size: 11px;
+        color: var(--ink);
       }
       .hint{
         margin-top: 8px;
         font-size: 12px;
         color: var(--muted);
       }
-      .btns{
-        margin-top: 12px;
-        display:flex;
-        gap: 10px;
-        flex-wrap: wrap;
-      }
       .check{
         display:flex;
         align-items:center;
         gap: 8px;
         margin-top: 10px;
-        font-size: 13px;
-        color: var(--txt);
+        font-size: 12px;
+        color: var(--ink);
       }
       .check input{
         width:auto;
@@ -200,14 +334,14 @@ HTML_INDEX = """<!doctype html>
         accent-color: var(--accent);
       }
       .dropzone{
-        border: 1.5px dashed var(--line);
-        border-radius: 14px;
-        padding: 14px;
-        background: rgba(255,255,255,.04);
+        border: 1.5px dashed var(--ink);
+        border-radius: 10px;
+        padding: 12px;
+        background: rgba(255,255,255,.7);
         cursor: pointer;
         display:flex;
         align-items:center;
-        gap: 10px;
+        gap: 12px;
         min-height: 64px;
         transition: border-color .15s ease, background .15s ease;
       }
@@ -221,31 +355,52 @@ HTML_INDEX = """<!doctype html>
       .dropzone .thumb{
         width: 44px;
         height: 44px;
-        border-radius: 10px;
+        border-radius: 8px;
         overflow:hidden;
-        background: rgba(255,255,255,.08);
+        background: var(--paper);
         display:flex;
         align-items:center;
         justify-content:center;
         font-size: 11px;
         color: var(--muted);
+        border: 1px solid var(--line);
       }
       .dropzone.active{
         border-color: var(--accent);
-        background: rgba(124,92,255,.08);
+        background: var(--accent-soft);
+      }
+      .dropzone--basic{
+        border-style: dotted;
+        background: rgba(255,255,255,.9);
+      }
+      .dropzone--basic .title{
+        font-weight: 500;
+      }
+      .dropzone--basic .hint{
+        font-size: 11px;
+      }
+      .dropzone--basic .choose{
+        font-family: var(--mono);
+        text-transform: uppercase;
+        letter-spacing: .14em;
+        font-size: 10px;
+        color: var(--muted);
       }
       button{
-        border: 1px solid var(--line);
-        border-radius: 12px;
-        background: linear-gradient(135deg, rgba(124,92,255,.85), rgba(39,227,194,.5));
+        border: 1px solid var(--ink);
+        border-radius: 8px;
+        background: var(--ink);
         color: white;
-        padding: 10px 14px;
+        padding: 10px 16px;
         font-weight: 600;
+        font-size: 11px;
+        letter-spacing: .18em;
+        text-transform: uppercase;
         cursor: pointer;
       }
       button.secondary{
-        background: rgba(255,255,255,.06);
-        color: var(--txt);
+        background: transparent;
+        color: var(--ink);
       }
       button:disabled{
         opacity: .55;
@@ -254,81 +409,92 @@ HTML_INDEX = """<!doctype html>
       details{
         margin-top: 10px;
         border: 1px solid var(--line);
-        border-radius: 12px;
-        background: rgba(255,255,255,.03);
+        border-radius: 10px;
+        background: rgba(255,255,255,.85);
       }
       summary{
         cursor:pointer;
-        padding: 10px 10px;
-        font-size: 12px;
+        padding: 10px 12px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: .16em;
         color: var(--muted);
         list-style: none;
       }
       summary::-webkit-details-marker{ display:none; }
-      details .bd2{ padding: 0 10px 10px; }
+      details .bd2{ padding: 0 12px 12px; }
 
       .kv{
         display:flex;
         justify-content:space-between;
         gap: 10px;
-        font-size: 12px;
+        font-size: 11px;
         color: var(--muted);
-        margin-top: 10px;
+        margin-top: 12px;
         border-top: 1px solid var(--line);
         padding-top: 10px;
+        text-transform: uppercase;
+        letter-spacing: .14em;
       }
-      .kv code{ font-family: var(--mono); color: var(--txt); }
+      .kv code{
+        font-family: var(--mono);
+        color: var(--ink);
+        text-transform:none;
+        letter-spacing: 0;
+      }
 
       .prog{
         display:grid;
-        gap: 10px;
+        gap: 12px;
       }
       .stage{
         display:grid;
         grid-template-columns: 1fr;
         gap: 6px;
-        padding: 10px 10px 12px;
+        padding: 10px 12px;
         border: 1px solid var(--line);
-        border-radius: 12px;
-        background: rgba(255,255,255,.03);
+        border-radius: 10px;
+        background: rgba(255,255,255,.7);
       }
       .stage .nm{
         display:flex;
         align-items:center;
         justify-content:space-between;
         gap: 10px;
-        font-size: 12px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: .12em;
         color: var(--muted);
       }
       .stage .nm strong{
-        color: var(--txt);
+        color: var(--ink);
         font-weight: 600;
       }
       progress{
         width:100%;
-        height: 10px;
+        height: 8px;
         border-radius: 999px;
         overflow: hidden;
         border: 1px solid var(--line);
-        background: rgba(255,255,255,.04);
+        background: rgba(0,0,0,.05);
       }
       progress::-webkit-progress-bar{
-        background: rgba(255,255,255,.06);
+        background: rgba(0,0,0,.05);
       }
       progress::-webkit-progress-value{
-        background: linear-gradient(90deg, var(--accent), var(--accent2));
+        background: var(--accent);
       }
       progress::-moz-progress-bar{
-        background: linear-gradient(90deg, var(--accent), var(--accent2));
+        background: var(--accent);
       }
 
       .err{
         margin-top: 10px;
         padding: 10px 12px;
-        border: 1px solid rgba(255,77,109,.35);
-        background: rgba(255,77,109,.10);
-        color: var(--txt);
-        border-radius: 12px;
+        border: 1px solid rgba(212,0,0,.45);
+        background: rgba(212,0,0,.08);
+        color: var(--ink);
+        border-radius: 8px;
         font-size: 12px;
         display:none;
       }
@@ -336,32 +502,36 @@ HTML_INDEX = """<!doctype html>
         display:grid;
         gap: 12px;
       }
+      .viewer-card{
+        margin: 18px 0;
+      }
       .viewer{
-        margin-top: 12px;
         border: 1px solid var(--line);
-        border-radius: 14px;
+        border-radius: 12px;
         padding: 12px;
-        background: rgba(255,255,255,.03);
+        background: rgba(255,255,255,.85);
       }
       .viewer-head{
         display:flex;
         align-items:center;
         justify-content:space-between;
         gap:10px;
-        margin-bottom: 10px;
+        margin-bottom: 12px;
       }
       .viewer-head .title{
-        font-weight: 700;
-        font-size: 13px;
+        font-weight: 600;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: .18em;
       }
       .viewer-frame{
         position: relative;
         width:100%;
-        aspect-ratio: 16/10;
-        border-radius: 12px;
+        height: clamp(420px, 65vh, 900px);
+        border-radius: 10px;
         overflow:hidden;
-        border: 1px solid var(--line);
-        background: rgba(0,0,0,.2);
+        border: 1px solid var(--ink);
+        background: #000;
       }
       .viewer-frame iframe{
         width:100%;
@@ -370,9 +540,9 @@ HTML_INDEX = """<!doctype html>
       }
       .preview{
         width:100%;
-        border-radius: 14px;
+        border-radius: 10px;
         border: 1px solid var(--line);
-        background: rgba(0,0,0,.12);
+        background: rgba(255,255,255,.7);
         aspect-ratio: 16/10;
         display:grid;
         place-items:center;
@@ -399,8 +569,9 @@ HTML_INDEX = """<!doctype html>
       }
       .dl a{
         font-family: var(--mono);
-        font-size: 12px;
-        color: var(--txt);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: .12em;
       }
       .small{
         font-size: 12px;
@@ -412,13 +583,109 @@ HTML_INDEX = """<!doctype html>
     <div class=\"wrap\">
       <header>
         <div class=\"brand\">
-          <h1>SHARP motion video</h1>
+          <p class=\"eyebrow\">Sharp</p>
+          <h1>Motion video studio</h1>
           <p>Upload a single image and render a short camera-motion clip. CUDA runs the full 3DGS renderer; macOS/MPS or CPU uses a depth-parallax fallback.</p>
         </div>
-        <div class=\"pill\" id=\"devicePill\">device: <span id=\"deviceText\">unknown</span></div>
+        <div class=\"meta\">
+          <div class=\"pill\" id=\"devicePill\">device: <span id=\"deviceText\">unknown</span></div>
+        </div>
       </header>
 
-      <div class=\"grid\">
+      <div class=\"tabs\" role=\"tablist\">
+        <button class=\"tab-button active\" id=\"tabBasic\" role=\"tab\" aria-selected=\"true\">Basic</button>
+        <button class=\"tab-button\" id=\"tabDev\" role=\"tab\" aria-selected=\"false\">Dev</button>
+      </div>
+
+      <section class=\"tab-panel active\" id=\"basicPanel\" role=\"tabpanel\">
+        <section class=\"card\">
+          <div class=\"hd\">
+            <h2>Basic export</h2>
+            <span class=\"pill\">PLY only</span>
+          </div>
+          <div class=\"bd\">
+            <form id=\"basicForm\">
+              <label for=\"basicImage\">Image</label>
+              <div class=\"dropzone dropzone--basic\" id=\"basicDropZone\">
+                <div class=\"thumb\" id=\"basicDropThumb\">IMG</div>
+                <div>
+                  <div class=\"title\">Drop image here</div>
+                  <p class=\"hint\">
+                    <span id=\"basicDropHint\">click to</span>
+                    <span class=\"choose\" id=\"basicDropHintChoose\">choose file</span>
+                  </p>
+                </div>
+              </div>
+              <input id=\"basicImage\" type=\"file\" name=\"image\" accept=\"image/*\" required style=\"display:none\" />
+              <input type=\"hidden\" name=\"output_mode\" value=\"ply\" />
+              <input type=\"hidden\" name=\"export_ply\" value=\"true\" />
+              <div class=\"basic-actions\">
+                <button id=\"basicGoBtn\" type=\"submit\">Generate PLY</button>
+                <button class=\"secondary\" id=\"basicResetBtn\" type=\"button\">Reset</button>
+              </div>
+              <div class=\"basic-progress\" id=\"basicProgress\">
+                <div class=\"basic-progress-bar\">
+                  <div class=\"basic-progress-fill\" id=\"basicProgressFill\"></div>
+                </div>
+                <div class=\"basic-status\" id=\"basicStatus\">idle</div>
+              </div>
+              <div class=\"basic-links\">
+                <a id=\"basicDownload\" href=\"#\" style=\"display:none\">download ply</a>
+                <a href=\"https://sparkjs.dev/examples/#editor\" target=\"_blank\" rel=\"noreferrer\">Open Spark Editor</a>
+              </div>
+              <div class=\"basic-queue\">
+                <div class=\"small\">Queue</div>
+                <ul id=\"basicQueue\"></ul>
+                <div class=\"small\" id=\"basicQueueMeta\">waiting: 0</div>
+              </div>
+            </form>
+          </div>
+        </section>
+        <section class=\"card viewer-card\">
+          <div class=\"hd\">
+            <h2>Spark editor preview</h2>
+            <span class=\"pill\">Editor</span>
+          </div>
+          <div class=\"bd\">
+            <div class=\"viewer\" id=\"viewerBlockBasic\">
+              <div class=\"viewer-head\">
+                <div>
+                  <div class=\"title\">Editor canvas</div>
+                  <div class=\"small\">Loads the exported .ply when ready.</div>
+                </div>
+                <button class=\"secondary\" type=\"button\" id=\"openViewerBtnBasic\">Reload editor</button>
+              </div>
+              <div class=\"viewer-frame\">
+                <iframe id=\"splatFrameBasic\" title=\"Gaussian splat viewer\" allowfullscreen></iframe>
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class=\"tab-panel\" id=\"devPanel\" role=\"tabpanel\">
+        <section class=\"card viewer-card\">
+          <div class=\"hd\">
+            <h2>Spark editor preview</h2>
+            <span class=\"pill\">Editor</span>
+          </div>
+          <div class=\"bd\">
+            <div class=\"viewer\" id=\"viewerBlock\">
+              <div class=\"viewer-head\">
+                <div>
+                  <div class=\"title\">Editor canvas</div>
+                  <div class=\"small\">Loads the exported .ply when ready.</div>
+                </div>
+                <button class=\"secondary\" type=\"button\" id=\"openViewerBtn\">Reload editor</button>
+              </div>
+              <div class=\"viewer-frame\">
+                <iframe id=\"splatFrame\" title=\"Gaussian splat viewer\" allowfullscreen></iframe>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div class=\"grid\">
         <section class=\"card\">
           <div class=\"hd\">
             <h2>Render Settings</h2>
@@ -538,8 +805,8 @@ HTML_INDEX = """<!doctype html>
                 <div>
                   <label for=\"output_mode\">Outputs</label>
                   <select id=\"output_mode\" name=\"output_mode\">
-                    <option value=\"depth\" selected>Depth MP4 only</option>
-                    <option value=\"ply\">PLY only</option>
+                    <option value=\"depth\">Depth MP4 only</option>
+                    <option value=\"ply\" selected>PLY only</option>
                     <option value=\"both\">Both MP4 + PLY</option>
                   </select>
                   <p class=\"hint\">“Depth MP4” forces the fast fallback render; “PLY” runs full SHARP to export 3DGS; “Both” does both.</p>
@@ -547,7 +814,7 @@ HTML_INDEX = """<!doctype html>
               </div>
 
               <div class=\"btns\">
-                <button id=\"goBtn\" type=\"submit\">Generate MP4</button>
+                <button id=\"goBtn\" type=\"submit\">Generate output</button>
                 <button class=\"secondary\" id=\"resetBtn\" type=\"button\">Reset</button>
               </div>
               <div class=\"err\" id=\"errBox\"></div>
@@ -609,26 +876,33 @@ HTML_INDEX = """<!doctype html>
                   <a id=\"downloadPlyLink\" href=\"#\" style=\"display:none\">download ply</a>
                 </div>
               </div>
-              <div class=\"viewer\" id=\"viewerBlock\" style=\"display:none\">
-                <div class=\"viewer-head\">
-                  <div>
-                    <div class=\"title\">Gaussian splat viewer</div>
-                    <div class=\"small\">Loads the exported .ply into the Spark viewer.</div>
-                  </div>
-                  <button class=\"secondary\" type=\"button\" id=\"openViewerBtn\">Open viewer</button>
-                </div>
-                <div class=\"viewer-frame\">
-                  <iframe id=\"splatFrame\" title=\"Gaussian splat viewer\" allowfullscreen></iframe>
-                </div>
-              </div>
             </div>
           </div>
         </section>
-      </div>
+        </div>
+      </section>
     </div>
 
     <script>
       const $ = (id) => document.getElementById(id);
+
+      const tabBasic = $(\"tabBasic\");
+      const tabDev = $(\"tabDev\");
+      const basicPanel = $(\"basicPanel\");
+      const devPanel = $(\"devPanel\");
+
+      function setActiveTab(tab) {
+        const isBasic = tab === \"basic\";
+        tabBasic.classList.toggle(\"active\", isBasic);
+        tabDev.classList.toggle(\"active\", !isBasic);
+        tabBasic.setAttribute(\"aria-selected\", isBasic ? \"true\" : \"false\");
+        tabDev.setAttribute(\"aria-selected\", isBasic ? \"false\" : \"true\");
+        basicPanel.classList.toggle(\"active\", isBasic);
+        devPanel.classList.toggle(\"active\", !isBasic);
+      }
+
+      tabBasic.addEventListener(\"click\", () => setActiveTab(\"basic\"));
+      tabDev.addEventListener(\"click\", () => setActiveTab(\"dev\"));
 
       const stageIds = [\"load\",\"inference\",\"trajectory\",\"render\",\"ply\",\"finalize\"];
       function setErr(msg){
@@ -667,9 +941,166 @@ HTML_INDEX = """<!doctype html>
       const defaultDropHint = \"JPEG / PNG / HEIC\";
       const downloadLink = $(\"downloadLink\");
       const downloadPlyLink = $(\"downloadPlyLink\");
-      const viewerBlock = $(\"viewerBlock\");
       const splatFrame = $(\"splatFrame\");
+      const splatFrameBasic = $(\"splatFrameBasic\");
       const openViewerBtn = $(\"openViewerBtn\");
+      const openViewerBtnBasic = $(\"openViewerBtnBasic\");
+      const defaultViewerUrl = \"/examples/editor/\";
+      const basicForm = $(\"basicForm\");
+      const basicImage = $(\"basicImage\");
+      const basicDropZone = $(\"basicDropZone\");
+      const basicDropThumb = $(\"basicDropThumb\");
+      const basicDropHint = $(\"basicDropHint\");
+      const basicDropHintChoose = $(\"basicDropHintChoose\");
+      const basicDefaultDropThumb = \"IMG\";
+      const basicDefaultDropHint = \"click to\";
+      const basicProgress = $(\"basicProgress\");
+      const basicProgressFill = $(\"basicProgressFill\");
+      const basicGoBtn = $(\"basicGoBtn\");
+      const basicResetBtn = $(\"basicResetBtn\");
+      const basicStatus = $(\"basicStatus\");
+      const basicDownload = $(\"basicDownload\");
+      const basicQueue = $(\"basicQueue\");
+      const basicQueueMeta = $(\"basicQueueMeta\");
+      let basicFileName = \"scene\";
+      let basicImageMeta = null;
+      let basicImageObjectUrl = null;
+      let metricsModel = { slope: 0, intercept: 12, sample_count: 0 };
+      let basicEstimateRaf = null;
+      let basicEstimateRunning = false;
+      let basicEstimateDuration = null;
+      let basicEstimateStart = 0;
+
+      function withCacheBust(url){
+        const sep = url.includes(\"?\") ? \"&\" : \"?\";
+        return `${url}${sep}t=${Date.now()}`;
+      }
+
+      function setViewerSrc(url){
+        [splatFrame, splatFrameBasic].forEach((frame) => {
+          if(frame) frame.src = url;
+        });
+      }
+
+      function bindViewerButton(button, frame, url){
+        if(!button || !frame) return;
+        button.onclick = () => {
+          frame.src = withCacheBust(url);
+        };
+      }
+
+      function bindViewerButtons(url){
+        bindViewerButton(openViewerBtn, splatFrame, url);
+        bindViewerButton(openViewerBtnBasic, splatFrameBasic, url);
+      }
+
+      bindViewerButtons(defaultViewerUrl);
+
+      async function loadMetricsModel(){
+        try{
+          const res = await fetch(\"/metrics/estimate\", { headers: {\"Accept\":\"application/json\"} });
+          if(!res.ok) return;
+          const data = await res.json();
+          if(data && typeof data === \"object\"){
+            metricsModel = {
+              slope: Number(data.slope) || 0,
+              intercept: Number(data.intercept) || 12,
+              sample_count: Number(data.sample_count) || 0,
+            };
+          }
+        }catch(err){
+          // Optional; fall back to defaults.
+        }
+      }
+
+      function readBasicImageMeta(file){
+        basicImageMeta = null;
+        if(!file) return;
+        if(basicImageObjectUrl) URL.revokeObjectURL(basicImageObjectUrl);
+        basicImageObjectUrl = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+          basicImageMeta = {
+            width: img.naturalWidth || 0,
+            height: img.naturalHeight || 0,
+          };
+          if(basicImageObjectUrl){
+            URL.revokeObjectURL(basicImageObjectUrl);
+            basicImageObjectUrl = null;
+          }
+        };
+        img.onerror = () => {
+          basicImageMeta = null;
+          if(basicImageObjectUrl){
+            URL.revokeObjectURL(basicImageObjectUrl);
+            basicImageObjectUrl = null;
+          }
+        };
+        img.src = basicImageObjectUrl;
+      }
+
+      function estimateSeconds(meta){
+        if(!meta || !meta.width || !meta.height) return null;
+        const mpix = (meta.width * meta.height) / 1_000_000;
+        const est = metricsModel.intercept + metricsModel.slope * mpix;
+        if(!isFinite(est) || est <= 0) return null;
+        return Math.max(1, Math.round(est * 2) / 2);
+      }
+
+      function formatSeconds(seconds){
+        const rounded = Math.max(0.5, Math.round(seconds * 2) / 2);
+        return `~${rounded.toFixed(1)}s remaining`;
+      }
+
+      function stopBasicEstimate(statusText){
+        basicEstimateRunning = false;
+        if(basicEstimateRaf){
+          cancelAnimationFrame(basicEstimateRaf);
+          basicEstimateRaf = null;
+        }
+        if(basicProgressFill){
+          if(statusText === \"done\"){
+            basicProgressFill.style.width = \"100%\";
+          }else if(statusText === \"error\"){
+            basicProgressFill.style.width = \"0%\";
+          }else if(statusText){
+            basicProgressFill.style.width = \"0%\";
+          }
+        }
+        if(basicStatus && statusText){
+          basicStatus.textContent = statusText;
+        }
+      }
+
+      function startBasicEstimate(){
+        stopBasicEstimate(\"\");
+        if(!basicProgressFill || !basicStatus) return;
+        const estimate = estimateSeconds(basicImageMeta);
+        basicProgressFill.style.width = \"0%\";
+        if(!estimate){
+          basicStatus.textContent = \"processing...\";
+          return;
+        }
+        basicEstimateDuration = estimate;
+        basicEstimateStart = performance.now();
+        basicEstimateRunning = true;
+
+        const tick = () => {
+          if(!basicEstimateRunning) return;
+          const elapsed = (performance.now() - basicEstimateStart) / 1000;
+          const progress = Math.min(elapsed / basicEstimateDuration, 1);
+          basicProgressFill.style.width = `${(progress * 100).toFixed(1)}%`;
+          if(progress >= 1){
+            basicStatus.textContent = \"processing...\";
+            basicEstimateRunning = false;
+            return;
+          }
+          const remaining = Math.max(0, basicEstimateDuration - elapsed);
+          basicStatus.textContent = formatSeconds(remaining);
+          basicEstimateRaf = requestAnimationFrame(tick);
+        };
+        basicEstimateRaf = requestAnimationFrame(tick);
+      }
 
       function setFile(file){
         if(!file) return;
@@ -712,6 +1143,61 @@ HTML_INDEX = """<!doctype html>
         }
       });
 
+      function updateBasicDropUi(file){
+        if(!basicDropZone || !basicDropThumb || !basicDropHint) return;
+        if(!file){
+          resetBasicDropUi();
+          return;
+        }
+        basicDropHint.textContent = file.name;
+        const ext = (file.type.split(\"/\")[1] || \"IMG\").slice(0, 4).toUpperCase();
+        basicDropThumb.textContent = ext || basicDefaultDropThumb;
+        if (basicDropHintChoose) basicDropHintChoose.style.display = \"none\";
+        basicDropZone.classList.remove(\"active\");
+      }
+
+      function resetBasicDropUi(){
+        if(!basicDropZone || !basicDropThumb || !basicDropHint) return;
+        basicDropThumb.textContent = basicDefaultDropThumb;
+        basicDropHint.textContent = basicDefaultDropHint;
+        if (basicDropHintChoose) basicDropHintChoose.style.display = \"inline\";
+        basicDropZone.classList.remove(\"active\");
+      }
+
+      function setBasicFile(file){
+        if(!file) return;
+        if(!file.type || !file.type.startsWith(\"image/\")){
+          setErr(\"Please drop an image file (jpg/png/heic).\");
+          return;
+        }
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        basicImage.files = dt.files;
+        basicImage.dispatchEvent(new Event(\"change\", { bubbles: true }));
+      }
+
+      if (basicDropZone) {
+        basicDropZone.addEventListener(\"click\", () => basicImage.click());
+        [\"dragenter\",\"dragover\"].forEach((evt) => {
+          basicDropZone.addEventListener(evt, (e) => {
+            e.preventDefault();
+            basicDropZone.classList.add(\"active\");
+          });
+        });
+        [\"dragleave\",\"drop\"].forEach((evt) => {
+          basicDropZone.addEventListener(evt, (e) => {
+            e.preventDefault();
+            basicDropZone.classList.remove(\"active\");
+          });
+        });
+        basicDropZone.addEventListener(\"drop\", (e) => {
+          const files = e.dataTransfer?.files;
+          if(files && files.length){
+            setBasicFile(files[0]);
+          }
+        });
+      }
+
       function bindSlider(id){
         const el = $(id);
         const out = $(id + \"_val\");
@@ -744,8 +1230,8 @@ HTML_INDEX = """<!doctype html>
         setOverall(0);
         downloadLink.style.display = \"none\";
         downloadPlyLink.style.display = \"none\";
-        viewerBlock.style.display = \"none\";
-        splatFrame.removeAttribute(\"src\");
+        setViewerSrc(defaultViewerUrl);
+        bindViewerButtons(defaultViewerUrl);
         $(\"vidPrev\").removeAttribute(\"src\");
         $(\"vidPrev\").style.display = \"none\";
         $(\"ph\").style.display = \"block\";
@@ -764,12 +1250,45 @@ HTML_INDEX = """<!doctype html>
         $(\"vidPrev\").style.display = \"none\";
         downloadLink.style.display = \"none\";
         downloadPlyLink.style.display = \"none\";
-        viewerBlock.style.display = \"none\";
-        splatFrame.removeAttribute(\"src\");
+        setViewerSrc(defaultViewerUrl);
+        bindViewerButtons(defaultViewerUrl);
         dropHint.textContent = f.name;
         const ext = (f.type.split(\"/\")[1] || defaultDropThumb).slice(0, 4).toUpperCase();
         dropThumb.textContent = ext || defaultDropThumb;
         setErr(\"\");
+      });
+
+      basicImage.addEventListener(\"change\", (e) => {
+        const f = e.target.files && e.target.files[0];
+        if(!f){
+          basicFileName = \"scene\";
+          basicImageMeta = null;
+          stopBasicEstimate(\"idle\");
+          basicDownload.style.display = \"none\";
+          resetBasicDropUi();
+          setViewerSrc(defaultViewerUrl);
+          bindViewerButtons(defaultViewerUrl);
+          return;
+        }
+        updateBasicDropUi(f);
+        readBasicImageMeta(f);
+        basicFileName = f.name.replace(/\\.[^/.]+$/, \"\") || \"scene\";
+        stopBasicEstimate(\"ready\");
+        basicDownload.style.display = \"none\";
+        setViewerSrc(defaultViewerUrl);
+        bindViewerButtons(defaultViewerUrl);
+      });
+
+      basicResetBtn.addEventListener(\"click\", () => {
+        basicForm.reset();
+        basicFileName = \"scene\";
+        basicImageMeta = null;
+        stopBasicEstimate(\"idle\");
+        basicDownload.style.display = \"none\";
+        resetBasicDropUi();
+        setViewerSrc(defaultViewerUrl);
+        bindViewerButtons(defaultViewerUrl);
+        fetchQueue();
       });
 
       async function fetchJson(url){
@@ -781,7 +1300,32 @@ HTML_INDEX = """<!doctype html>
         return await res.json();
       }
 
-      async function poll(jobId){
+      async function fetchQueue(){
+        if(!basicQueue || !basicQueueMeta) return;
+        try{
+          const data = await fetchJson(\"/queue\");
+          const entries = data.queue || [];
+          basicQueue.innerHTML = \"\";
+          if(entries.length === 0){
+            const li = document.createElement(\"li\");
+            li.textContent = \"empty\";
+            basicQueue.appendChild(li);
+          }else{
+            entries.forEach((item) => {
+              const li = document.createElement(\"li\");
+              const name = item.image_name || \"scene\";
+              li.innerHTML = `<span>${item.status}</span><span class=\"tag\">${name}.ply</span>`;
+              basicQueue.appendChild(li);
+            });
+          }
+          basicQueueMeta.textContent = `waiting: ${data.waiting_total || 0} across ${data.active_sessions || 0} queues`;
+        }catch(err){
+          basicQueueMeta.textContent = \"queue unavailable\";
+        }
+      }
+
+      async function poll(jobId, options = {}){
+        const useBasicProgress = options.useBasicProgress === true;
         while(true){
           const st = await fetchJson(`/jobs/${jobId}`);
           if(st.device) $(\"deviceText\").textContent = st.device;
@@ -798,11 +1342,13 @@ HTML_INDEX = """<!doctype html>
             setStatus(\"error\");
             setErr(st.error || \"Render failed.\");
             $(\"goBtn\").disabled = false;
+            if(useBasicProgress) stopBasicEstimate(\"error\");
             return;
           }
           if(st.status === \"done\"){
             setStatus(\"done\");
             setErr(\"\");
+            if(useBasicProgress) stopBasicEstimate(\"done\");
             if(st.video_ready){
               const resultUrl = `/jobs/${jobId}/result`;
               const downloadUrl = `${resultUrl}?download=1`;
@@ -823,22 +1369,28 @@ HTML_INDEX = """<!doctype html>
               $(\"ph\").style.display = \"block\";
             }
             if(st.ply_ready){
-              const plyUrl = `/jobs/${jobId}/ply`;
+              const safeName = (basicFileName || "scene").replace(/[^a-zA-Z0-9_-]+/g, "_");
+              const plyUrl = `/jobs/${jobId}/ply/${safeName}.ply`;
               downloadPlyLink.href = `${plyUrl}?download=1`;
               downloadPlyLink.style.display = \"inline\";
-              const viewerUrl = `/viewer/?url=${encodeURIComponent(plyUrl)}`;
-              splatFrame.src = viewerUrl;
-              viewerBlock.style.display = \"block\";
-              openViewerBtn.onclick = () => {
-                splatFrame.src = `${viewerUrl}&t=${Date.now()}`;
-                splatFrame.scrollIntoView({ behavior: \"smooth\", block: \"center\" });
-              };
+              if (basicDownload) {
+                basicDownload.href = `${plyUrl}?download=1`;
+                basicDownload.style.display = \"inline\";
+                basicDownload.textContent = `download ${basicFileName}.ply`;
+              }
+              const viewerUrl = `/examples/editor/?url=${encodeURIComponent(plyUrl)}`;
+              setViewerSrc(viewerUrl);
+              bindViewerButtons(viewerUrl);
             }else{
               downloadPlyLink.style.display = \"none\";
-              viewerBlock.style.display = \"none\";
-              splatFrame.removeAttribute(\"src\");
+              setViewerSrc(defaultViewerUrl);
+              bindViewerButtons(defaultViewerUrl);
+              if (basicDownload) {
+                basicDownload.style.display = \"none\";
+              }
             }
             $(\"goBtn\").disabled = false;
+            if (basicGoBtn) basicGoBtn.disabled = false;
             return;
           }
           await new Promise(r => setTimeout(r, 250));
@@ -852,8 +1404,8 @@ HTML_INDEX = """<!doctype html>
         $(\"goBtn\").disabled = true;
         downloadLink.style.display = \"none\";
         downloadPlyLink.style.display = \"none\";
-        viewerBlock.style.display = \"none\";
-        splatFrame.removeAttribute(\"src\");
+        setViewerSrc(defaultViewerUrl);
+        bindViewerButtons(defaultViewerUrl);
         stageIds.forEach(s => setProgress(s, 0, \"–\"));
         setOverall(0);
 
@@ -882,8 +1434,43 @@ HTML_INDEX = """<!doctype html>
         }
       });
 
+      basicForm.addEventListener(\"submit\", async (e) => {
+        e.preventDefault();
+        stopBasicEstimate(\"starting\");
+        basicGoBtn.disabled = true;
+        basicDownload.style.display = \"none\";
+        fetchQueue();
+        if(!basicImage.files || !basicImage.files[0]){
+          stopBasicEstimate(\"please add an image\");
+          basicGoBtn.disabled = false;
+          fetchQueue();
+          return;
+        }
+        try{
+          const fd = new FormData(basicForm);
+          const res = await fetch(\"/jobs\", { method: \"POST\", body: fd });
+          if(!res.ok){
+            const txt = await res.text().catch(() => \"\");
+            throw new Error(`HTTP ${res.status}: ${txt || res.statusText}`);
+          }
+          const js = await res.json();
+          const jobId = js.job_id;
+          $(\"jobId\").textContent = jobId;
+          startBasicEstimate();
+          await poll(jobId, { useBasicProgress: true });
+        }catch(err){
+          stopBasicEstimate(err && err.message ? err.message : String(err));
+          basicGoBtn.disabled = false;
+        }
+      });
+
       // Best-effort device hint, server will set it once a job starts.
       $(\"deviceText\").textContent = \"server-side\";
+      loadMetricsModel();
+      setViewerSrc(defaultViewerUrl);
+      bindViewerButtons(defaultViewerUrl);
+      fetchQueue();
+      setInterval(fetchQueue, 1000);
     </script>
   </body>
 </html>
@@ -945,6 +1532,26 @@ def _is_authorized(auth_header: str | None, *, password: str) -> bool:
     return False
 
 
+def _read_image_size(image_bytes: bytes, filename: str | None) -> tuple[int | None, int | None]:
+    try:
+        from PIL import Image
+
+        if filename and filename.lower().endswith(".heic"):
+            try:
+                import pillow_heif
+
+                heif = pillow_heif.open_heif(image_bytes, convert_hdr_to_8bit=True)
+                img = heif.to_pillow()
+                return img.width, img.height
+            except Exception:
+                return None, None
+
+        img = Image.open(io.BytesIO(image_bytes))
+        return img.width, img.height
+    except Exception:
+        return None, None
+
+
 def create_app(*, password: str | None = None, password_file: str | None = None):
     """Create the FastAPI app.
 
@@ -953,9 +1560,9 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
     """
 
     try:
-        from fastapi import FastAPI, File, Form, UploadFile
+        from fastapi import FastAPI, File, Form, Request, UploadFile
         from fastapi.staticfiles import StaticFiles
-        from fastapi.responses import HTMLResponse, Response
+        from fastapi.responses import HTMLResponse, JSONResponse, Response
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "FastAPI is not installed. Install web deps with: "
@@ -990,10 +1597,136 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
 
         app.add_middleware(_BasicAuthMiddleware, password=web_password)
 
+    import threading
+
     root_dir = Path(__file__).resolve().parents[3]
+    metrics_path = root_dir / "data" / "web_metrics.json"
+    metrics_lock = threading.Lock()
+
+    def record_metrics(job: "_Job", finished_at_s: float) -> None:
+        if job.requested_at_s is None:
+            return
+        entry = {
+            "job_id": job.job_id,
+            "requested_at_s": job.requested_at_s,
+            "finished_at_s": finished_at_s,
+            "duration_s": max(0.0, finished_at_s - job.requested_at_s),
+            "image_name": job.image_name,
+            "image_width": job.image_width,
+            "image_height": job.image_height,
+            "output_mode": job.output_mode,
+            "device": job.device,
+        }
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_lock:
+            data: list[dict[str, Any]]
+            if metrics_path.exists():
+                try:
+                    data = json.loads(metrics_path.read_text(encoding="utf-8"))
+                    if not isinstance(data, list):
+                        data = []
+                except Exception:
+                    data = []
+            else:
+                data = []
+            data.append(entry)
+            metrics_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def _load_metrics() -> list[dict[str, Any]]:
+        with metrics_lock:
+            if not metrics_path.exists():
+                return []
+            try:
+                data = json.loads(metrics_path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    return [d for d in data if isinstance(d, dict)]
+            except Exception:
+                return []
+        return []
+
+    def _fit_duration_model() -> dict[str, float]:
+        data = _load_metrics()
+        points: list[tuple[float, float]] = []
+        for entry in data:
+            try:
+                width = float(entry.get("image_width") or 0)
+                height = float(entry.get("image_height") or 0)
+                duration = float(entry.get("duration_s") or 0)
+            except (TypeError, ValueError):
+                continue
+            if width <= 0 or height <= 0 or duration <= 0:
+                continue
+            output_mode = str(entry.get("output_mode") or "ply").lower()
+            if output_mode not in {"ply", "both"}:
+                continue
+            mpix = (width * height) / 1_000_000.0
+            points.append((mpix, duration))
+
+        if not points:
+            return {"slope": 0.0, "intercept": 12.0, "sample_count": 0}
+        if len(points) == 1:
+            return {"slope": 0.0, "intercept": float(points[0][1]), "sample_count": 1}
+
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        mean_x = sum(xs) / len(xs)
+        mean_y = sum(ys) / len(ys)
+        var_x = sum((x - mean_x) ** 2 for x in xs)
+        if var_x <= 1e-6:
+            return {"slope": 0.0, "intercept": float(mean_y), "sample_count": len(points)}
+        cov_xy = sum((x - mean_x) * (y - mean_y) for x, y in points)
+        slope = cov_xy / var_x
+        intercept = mean_y - slope * mean_x
+        return {"slope": float(slope), "intercept": float(intercept), "sample_count": len(points)}
+
+    session_cookie = "sharp_session"
+
+    def get_session_id(request: Request) -> tuple[str, bool]:
+        session_id = request.cookies.get(session_cookie)
+        if session_id:
+            return session_id, False
+        return uuid.uuid4().hex, True
+
+    queue_condition = asyncio.Condition()
+    user_queues: dict[str, deque[tuple[str, bytes, dict[str, Any], bool, str]]] = {}
+    user_order: deque[str] = deque()
+    current_job_id: str | None = None
+    current_session_id: str | None = None
+
+    async def enqueue_job(
+        session_id: str,
+        payload: tuple[str, bytes, dict[str, Any], bool, str],
+    ) -> None:
+        async with queue_condition:
+            queue = user_queues.setdefault(session_id, deque())
+            queue.append(payload)
+            if session_id not in user_order:
+                user_order.append(session_id)
+            queue_condition.notify()
+
+    async def dequeue_job() -> tuple[str, tuple[str, bytes, dict[str, Any], bool, str]]:
+        async with queue_condition:
+            while True:
+                while not user_order:
+                    await queue_condition.wait()
+                session_id = user_order.popleft()
+                queue = user_queues.get(session_id)
+                if not queue:
+                    continue
+                payload = queue.popleft()
+                if queue:
+                    user_order.append(session_id)
+                return session_id, payload
     splat_dir = root_dir / "splat"
     if splat_dir.is_dir():
         app.mount("/splat", StaticFiles(directory=splat_dir, html=True), name="splat")
+    spark_examples_dir = root_dir / "spark" / "examples"
+    if spark_examples_dir.is_dir():
+        app.mount(
+            "/examples",
+            StaticFiles(directory=spark_examples_dir, html=True),
+            name="spark-examples",
+        )
     spark_viewer_dir = root_dir / "spark" / "examples" / "viewer"
     if spark_viewer_dir.is_dir():
         app.mount(
@@ -1029,7 +1762,7 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
         updated_at_s: float
         status: Literal["queued", "running", "done", "error"] = "queued"
         export_ply: bool = False
-        output_mode: Literal["depth", "ply", "both"] = "depth"
+        output_mode: Literal["depth", "ply", "both"] = "ply"
         error: str | None = None
         detail: str | None = None
         device: str | None = None
@@ -1037,6 +1770,12 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
         stages: dict[str, _Stage] = dataclasses.field(default_factory=dict)
         video_bytes: bytes | None = None
         ply_bytes: bytes | None = None
+        requested_at_s: float | None = None
+        image_width: int | None = None
+        image_height: int | None = None
+        image_name: str = "scene"
+        metrics_recorded: bool = False
+        session_id: str = ""
 
     class _JobStore:
         def __init__(self) -> None:
@@ -1049,7 +1788,12 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
             self,
             *,
             export_ply: bool = False,
-            output_mode: Literal["depth", "ply", "both"] = "depth",
+            output_mode: Literal["depth", "ply", "both"] = "ply",
+            requested_at_s: float | None = None,
+            image_width: int | None = None,
+            image_height: int | None = None,
+            image_name: str = "scene",
+            session_id: str = "",
         ) -> _Job:
             now = time.time()
             job_id = uuid.uuid4().hex[:12]
@@ -1062,6 +1806,11 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
                 export_ply=export_ply,
                 output_mode=output_mode,
                 stages=stages,
+                requested_at_s=requested_at_s or now,
+                image_width=image_width,
+                image_height=image_height,
+                image_name=image_name or "scene",
+                session_id=session_id,
             )
             with self._lock:
                 self._jobs[job_id] = job
@@ -1147,9 +1896,11 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
                     job.device = device
                 if ply_bytes is not None:
                     job.ply_bytes = ply_bytes
+                if status == "done" and not job.metrics_recorded:
+                    job.metrics_recorded = True
+                    record_metrics(job, now)
 
     store = _JobStore()
-    job_queue: asyncio.Queue[tuple[str, bytes, dict[str, Any], bool, str]] = asyncio.Queue()
 
     async def _run_job(
         job_id: str, image_bytes: bytes, params: dict[str, Any], export_ply: bool, output_mode: str
@@ -1238,14 +1989,19 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
             store.set_status(job_id, "error", error=str(exc), detail="Render failed.")
 
     async def _worker() -> None:
+        nonlocal current_job_id, current_session_id
         while True:
-            job_id, image_bytes, params, export_ply, output_mode = await job_queue.get()
+            session_id, payload = await dequeue_job()
+            job_id, image_bytes, params, export_ply, output_mode = payload
+            current_job_id = job_id
+            current_session_id = session_id
             try:
                 await _run_job(job_id, image_bytes, params, export_ply, output_mode)
             except Exception as exc:  # pragma: no cover
                 store.set_status(job_id, "error", error=str(exc), detail="Worker failed.")
             finally:
-                job_queue.task_done()
+                current_job_id = None
+                current_session_id = None
 
     @app.on_event("startup")
     async def _start_worker() -> None:
@@ -1260,8 +2016,12 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
                 await task
 
     @app.get("/", response_class=HTMLResponse)
-    def index():
-        return HTML_INDEX
+    def index(request: Request):
+        session_id, set_cookie = get_session_id(request)
+        response = HTMLResponse(HTML_INDEX)
+        if set_cookie:
+            response.set_cookie(session_cookie, session_id, max_age=60 * 60 * 24 * 30)
+        return response
 
     @app.post("/pan")
     async def pan(
@@ -1297,6 +2057,7 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
 
     @app.post("/jobs")
     async def create_job(
+        request: Request,
         image: UploadFile = File(...),
         duration_s: float = Form(4.0),
         fps: int = Form(30),
@@ -1309,19 +2070,31 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
         max_side: int = Form(1536),
         render_max_side: int = Form(1536),
         export_ply: bool = Form(False),
-        output_mode: str = Form("depth"),
-    ) -> dict[str, Any]:
+        output_mode: str = Form("ply"),
+    ) -> Response:
         store.cleanup()
+        session_id, set_cookie = get_session_id(request)
         output_mode = str(output_mode).lower()
         allowed_modes = {"depth", "ply", "both"}
         if output_mode not in allowed_modes:
             raise ValueError(f"output_mode must be one of {sorted(allowed_modes)}")
         export_ply = bool(export_ply) or output_mode in {"ply", "both"}
 
-        job = store.create(export_ply=export_ply, output_mode=output_mode)  # type: ignore[arg-type]
-        job_id = job.job_id
-
         image_bytes = await image.read()
+        raw_name = Path(image.filename or "scene").name
+        image_name = Path(raw_name).stem or "scene"
+        image_width, image_height = _read_image_size(image_bytes, raw_name)
+        requested_at_s = time.time()
+        job = store.create(
+            export_ply=export_ply,
+            output_mode=output_mode,
+            requested_at_s=requested_at_s,
+            image_width=image_width,
+            image_height=image_height,
+            image_name=image_name,
+            session_id=session_id,
+        )  # type: ignore[arg-type]
+        job_id = job.job_id
         params = {
             "duration_s": duration_s,
             "fps": fps,
@@ -1334,9 +2107,12 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
             "max_side": max_side,
             "render_max_side": render_max_side,
         }
-        await job_queue.put((job_id, image_bytes, params, export_ply, output_mode))
+        await enqueue_job(session_id, (job_id, image_bytes, params, export_ply, output_mode))
         store.set_status(job_id, "queued", detail="Queued.")
-        return {"job_id": job_id}
+        response = JSONResponse({"job_id": job_id})
+        if set_cookie:
+            response.set_cookie(session_cookie, session_id, max_age=60 * 60 * 24 * 30)
+        return response
 
     @app.get("/jobs/{job_id}")
     def get_job(job_id: str) -> dict[str, Any]:
@@ -1361,6 +2137,53 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
             },
         }
 
+    @app.get("/queue")
+    async def get_queue(request: Request) -> Response:
+        session_id, set_cookie = get_session_id(request)
+        async with queue_condition:
+            queued_payloads = list(user_queues.get(session_id, deque()))
+            queue_entries = []
+            if current_session_id == session_id and current_job_id:
+                job = store.get(current_job_id)
+                queue_entries.append(
+                    {
+                        "job_id": current_job_id,
+                        "status": "running",
+                        "image_name": job.image_name if job else "scene",
+                        "position": 0,
+                    }
+                )
+            for idx, payload in enumerate(queued_payloads, start=1):
+                job_id = payload[0]
+                job = store.get(job_id)
+                queue_entries.append(
+                    {
+                        "job_id": job_id,
+                        "status": "queued",
+                        "image_name": job.image_name if job else "scene",
+                        "position": idx,
+                    }
+                )
+            waiting_total = sum(len(q) for q in user_queues.values())
+            active_sessions = sum(1 for q in user_queues.values() if q)
+        response = JSONResponse(
+            {
+                "session_id": session_id,
+                "current_job_id": current_job_id,
+                "queue": queue_entries,
+                "waiting_total": waiting_total,
+                "active_sessions": active_sessions,
+            }
+        )
+        if set_cookie:
+            response.set_cookie(session_cookie, session_id, max_age=60 * 60 * 24 * 30)
+        return response
+
+    @app.get("/metrics/estimate")
+    def get_metrics_estimate() -> Response:
+        model = _fit_duration_model()
+        return JSONResponse(model)
+
     @app.get("/jobs/{job_id}/result")
     def get_result(job_id: str, download: int = 0):
         job = store.get(job_id)
@@ -1376,8 +2199,13 @@ def create_app(*, password: str | None = None, password_file: str | None = None)
         if job is None or job.status != "done" or job.ply_bytes is None:
             return Response(content=b"Not ready.", status_code=404)
         disposition = "attachment" if int(download) else "inline"
-        headers = {"Content-Disposition": f"{disposition}; filename=scene.ply"}
+        filename = f"{job.image_name or 'scene'}.ply"
+        headers = {"Content-Disposition": f"{disposition}; filename={filename}"}
         return Response(content=job.ply_bytes, media_type="application/octet-stream", headers=headers)
+
+    @app.get("/jobs/{job_id}/ply/{filename}.ply")
+    def get_ply_named(job_id: str, filename: str, download: int = 0):
+        return get_ply(job_id, download=download)
 
     return app
 

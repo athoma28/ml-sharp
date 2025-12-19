@@ -1,0 +1,123 @@
+[
+  {
+    "job_id": "e0e923891b21",
+    "requested_at_s": 1766169954.057246,
+    "finished_at_s": 1766169971.759976,
+    "duration_s": 17.70272994041443,
+    "image_name": "DSCF8120",
+    "image_width": 7205,
+    "image_height": 4803,
+    "output_mode": "ply",
+    "device": "mps"
+  },
+  {
+    "job_id": "28275445711e",
+    "requested_at_s": 1766170116.5998871,
+    "finished_at_s": 1766170128.400755,
+    "duration_s": 11.800867795944214,
+    "image_name": "DSCF0151",
+    "image_width": 6967,
+    "image_height": 4645,
+    "output_mode": "ply",
+    "device": "mps"
+  },
+  {
+    "job_id": "9034a35e07ef",
+    "requested_at_s": 1766170340.26139,
+    "finished_at_s": 1766170351.744287,
+    "duration_s": 11.48289704322815,
+    "image_name": "DSCF9792",
+    "image_width": 5428,
+    "image_height": 3619,
+    "output_mode": "ply",
+    "device": "mps"
+  },
+  {
+    "job_id": "2b95c4445db2",
+    "requested_at_s": 1766170882.980135,
+    "finished_at_s": 1766170900.30317,
+    "duration_s": 17.32303500175476,
+    "image_name": "DSCF6095",
+    "image_width": 6432,
+    "image_height": 5152,
+    "output_mode": "ply",
+    "device": "mps"
+  },
+  {
+    "job_id": "f5d2e02fc33e",
+    "requested_at_s": 1766171685.97708,
+    "finished_at_s": 1766171703.710687,
+    "duration_s": 17.733606815338135,
+    "image_name": "DSCF0153_1",
+    "image_width": 3672,
+    "image_height": 3672,
+    "output_mode": "ply",
+    "device": "mps"
+  },
+  {
+    "job_id": "9a22e80e3b4f",
+    "requested_at_s": 1766172381.2738261,
+    "finished_at_s": 1766172398.7065809,
+    "duration_s": 17.43275475502014,
+    "image_name": "DSCF9451",
+    "image_width": 5074,
+    "image_height": 5074,
+    "output_mode": "ply",
+    "device": "mps"
+  },
+  {
+    "job_id": "010057eb21a2",
+    "requested_at_s": 1766172895.689895,
+    "finished_at_s": 1766172914.940635,
+    "duration_s": 19.25074005126953,
+    "image_name": "DSCF9724",
+    "image_width": 5152,
+    "image_height": 7728,
+    "output_mode": "ply",
+    "device": "mps"
+  },
+  {
+    "job_id": "db0a7e779a88",
+    "requested_at_s": 1766172953.524279,
+    "finished_at_s": 1766172965.710167,
+    "duration_s": 12.185887813568115,
+    "image_name": "DSCF9821",
+    "image_width": 5152,
+    "image_height": 7728,
+    "output_mode": "ply",
+    "device": "mps"
+  },
+  {
+    "job_id": "9915ebde05dc",
+    "requested_at_s": 1766173710.034818,
+    "finished_at_s": 1766173729.922144,
+    "duration_s": 19.88732600212097,
+    "image_name": "DSCF7779",
+    "image_width": 3653,
+    "image_height": 3653,
+    "output_mode": "ply",
+    "device": "mps"
+  },
+  {
+    "job_id": "20fa936279de",
+    "requested_at_s": 1766173858.689302,
+    "finished_at_s": 1766173867.457271,
+    "duration_s": 8.767969131469727,
+    "image_name": "DSCF9451",
+    "image_width": 5074,
+    "image_height": 5074,
+    "output_mode": "ply",
+    "device": "mps"
+  },
+  {
+    "job_id": "f5a2465c8c1a",
+    "requested_at_s": 1766174066.29935,
+    "finished_at_s": 1766174074.985604,
+    "duration_s": 8.686254024505615,
+    "image_name": "DSCF6102",
+    "image_width": 6432,
+    "image_height": 5152,
+    "output_mode": "ply",
+    "device": "mps"
+  }
+]
